@@ -59,9 +59,10 @@ with `register_buffer`.
 - The same `key-prefix`, `key-size`, and `object-id-start` produce the same key sequence
 - `verify` currently requires `pattern`
 - Any write-involved scenario requires `value-size` to be 512-byte aligned
-- `memory-replica-num` and `nof-replica-num` cannot both be `0`
-- `dfs-replica-num` adds a DFS replica; it may be `0` or `1`, and `1` requires
-  `memory-replica-num >= 1`
+- At least one memory, NoF, or DFS replica is required.
+- DFS-only uses `--memory-replica-num 0 --nof-replica-num 0 --dfs-replica-num 1`;
+  it requires a configured DFS backend on both the Master and client.
+- `dfs-replica-num` may be `0` or `1`.
 - Any process that writes or reads DFS replicas must pass `--enable-ssd-offload`,
   which maps to `setup(enable_ssd_offload=True)`; without it DFS puts fail with
   `-1601` (`DFS_SERVICE_UNAVAILABLE`)

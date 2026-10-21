@@ -59,6 +59,22 @@ SPEC.loader.exec_module(bench)
 
 
 class StoreModuleCompatibilityTest(unittest.TestCase):
+    def test_dfs_only_replica_configuration_is_accepted(self):
+        args = bench.build_parser().parse_args(
+            [
+                "--scenario", "read_perf", "--memory-replica-num", "0",
+                "--dfs-replica-num", "1",
+            ]
+        )
+        bench.BenchmarkRunner(args)
+
+    def test_no_replica_configuration_is_rejected(self):
+        args = bench.build_parser().parse_args(
+            ["--scenario", "read_perf", "--memory-replica-num", "0"]
+        )
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            bench.BenchmarkRunner(args)
+
     def test_import_does_not_require_buffer_pool(self):
         del store_module.BufferPool
         module_name = "store_kv_bench_without_buffer_pool"
