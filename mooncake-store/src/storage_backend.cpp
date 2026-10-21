@@ -58,6 +58,9 @@ struct FdGuard {
 #ifdef HAVE_S3_ADAPTER
 #include "storage/distributed/s3_adapter.h"
 #endif
+#ifdef USE_COGNISTORE
+#include "storage/distributed/cognistore_adapter.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -5638,6 +5641,12 @@ CreateStorageBackend(const FileStorageConfig& config) {
             std::unique_ptr<ObjectStorageAdapter> object_storage_adapter;
             if (distributed_config.fs_adapter_type == "posix") {
                 fs_adapter = std::make_unique<PosixFsAdapter>();
+            } else if (distributed_config.fs_adapter_type == "cognistore") {
+#ifdef USE_COGNISTORE
+                fs_adapter = std::make_unique<CogniStoreFsAdapter>();
+#else
+                return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
             } else if (distributed_config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
                 fs_adapter = std::make_unique<Hf3fsAdapter>();

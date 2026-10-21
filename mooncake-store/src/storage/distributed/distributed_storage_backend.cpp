@@ -195,14 +195,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
         return {};
     }
 
-    std::error_code ec;
-    std::filesystem::create_directories(root_dir_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS root directory " << root_dir_
-                   << ": " << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) return init_result;
 
@@ -291,13 +283,13 @@ DistributedStorageBackend::ValidateAndOpenShardFile(
     auto root = std::filesystem::path(root_dir_).lexically_normal();
     if (root.filename().empty()) root = root.parent_path();
     const auto path = std::filesystem::path(file_path);
-    std::error_code ec;
-    const auto canonical_root = std::filesystem::canonical(root, ec);
-    if (ec) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    const auto canonical_path = std::filesystem::canonical(path, ec);
-    if (ec) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    if (canonical_path.parent_path() != canonical_root ||
-        canonical_path.filename() != path.filename()) {
+    const auto canonical_root = fs_adapter_->CanonicalPath(root.string());
+    if (!canonical_root) return tl::make_unexpected(canonical_root.error());
+    const auto canonical_path = fs_adapter_->CanonicalPath(path.string());
+    if (!canonical_path) return tl::make_unexpected(canonical_path.error());
+    const std::filesystem::path resolved(*canonical_path);
+    if (resolved.parent_path() != std::filesystem::path(*canonical_root) ||
+        resolved.filename() != path.filename()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return fs_adapter_->OpenFile(file_path);
@@ -344,13 +336,13 @@ tl::expected<int, ErrorCode> DistributedStorageBackend::OpenBucket(
     if (*file_size != distributed_config_.bucket_capacity) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::error_code error;
-    const auto canonical_root = std::filesystem::canonical(root, error);
-    if (error) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    const auto canonical_path = std::filesystem::canonical(path, error);
-    if (error) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    if (canonical_path.parent_path() != canonical_root ||
-        canonical_path.filename() != path.filename()) {
+    const auto canonical_root = fs_adapter_->CanonicalPath(root.string());
+    if (!canonical_root) return tl::make_unexpected(canonical_root.error());
+    const auto canonical_path = fs_adapter_->CanonicalPath(path.string());
+    if (!canonical_path) return tl::make_unexpected(canonical_path.error());
+    const std::filesystem::path resolved(*canonical_path);
+    if (resolved.parent_path() != std::filesystem::path(*canonical_root) ||
+        resolved.filename() != path.filename()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return fs_adapter_->OpenExistingFile(file_path);

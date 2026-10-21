@@ -41,7 +41,7 @@ bool DistributedStorageConfig::Validate() const {
         return false;
     }
     if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix" &&
-        !UsesObjectStorage()) {
+        fs_adapter_type != "cognistore" && !UsesObjectStorage()) {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
@@ -53,6 +53,11 @@ bool DistributedStorageConfig::Validate() const {
     if (!parsed_allocator) {
         LOG(ERROR) << "DistributedStorageConfig: unsupported allocator_type: "
                    << allocator_type;
+        return false;
+    }
+    // The initial CogniStore integration qualifies immutable buckets only.
+    if (fs_adapter_type == "cognistore" && allocator_type != "bucket") {
+        LOG(ERROR) << "CogniStore requires allocator_type=bucket";
         return false;
     }
     // alignment is shared by both allocators.

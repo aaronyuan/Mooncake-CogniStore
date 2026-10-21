@@ -35,6 +35,7 @@ option(
   "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)"
   OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
+option(USE_COGNISTORE "Build the CogniStore SDK DFS adapter" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)

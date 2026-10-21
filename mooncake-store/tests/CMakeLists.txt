@@ -525,3 +525,11 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+if(USE_COGNISTORE)
+  # Run explicitly against a ready cluster, never as an implicit unit test.
+  add_executable(cognistore_integration cognistore_integration.cpp)
+  target_include_directories(cognistore_integration
+                             PRIVATE ${COGNISTORE_INCLUDE_DIR})
+  target_link_libraries(cognistore_integration PRIVATE mooncake_store)
+endif()

@@ -282,6 +282,16 @@ if(ENABLE_KV_EVENTS)
   set(KV_EVENTS_ZMQ_FOUND TRUE)
 endif()
 
+if(USE_COGNISTORE)
+  find_path(COGNISTORE_INCLUDE_DIR cognistore/sdk/cogni.h REQUIRED)
+  find_library(COGNISTORE_LIBRARY NAMES cogni REQUIRED)
+  include_directories(${COGNISTORE_INCLUDE_DIR})
+  add_compile_definitions(USE_COGNISTORE)
+  list(APPEND MOONCAKE_STORE_SHARED_SOURCES
+       storage/distributed/cognistore_adapter.cpp)
+  list(APPEND EXTRA_LIBS ${COGNISTORE_LIBRARY})
+endif()
+
 if(USE_3FS)
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_SHARED_SOURCES ${HF3FS_SOURCES})

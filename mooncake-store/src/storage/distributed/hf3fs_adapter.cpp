@@ -1,5 +1,7 @@
 #include "storage/distributed/hf3fs_adapter.h"
 
+#include <filesystem>
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -8,7 +10,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <filesystem>
 
 #include <glog/logging.h>
 
@@ -23,6 +24,9 @@ Hf3fsAdapter::Hf3fsAdapter() = default;
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     const std::string& mount_path) {
+    std::error_code ec;
+    std::filesystem::create_directories(mount_path, ec);
+    if (ec) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     resource_manager_ = std::make_unique<USRBIOResourceManager>();
     Hf3fsConfig config{};
     char hf3fs_mount_point[PATH_MAX] = {};

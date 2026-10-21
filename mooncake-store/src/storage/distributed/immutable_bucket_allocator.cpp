@@ -10,6 +10,9 @@
 
 #include "config/distributed_storage_config.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#ifdef USE_COGNISTORE
+#include "storage/distributed/cognistore_adapter.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -81,6 +84,12 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     std::unique_ptr<FileSystemAdapter> adapter;
     if (config.fs_adapter_type == "posix") {
         adapter = std::make_unique<PosixFsAdapter>();
+    } else if (config.fs_adapter_type == "cognistore") {
+#ifdef USE_COGNISTORE
+        adapter = std::make_unique<CogniStoreFsAdapter>();
+#else
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
     } else if (config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
         adapter = std::make_unique<Hf3fsAdapter>();

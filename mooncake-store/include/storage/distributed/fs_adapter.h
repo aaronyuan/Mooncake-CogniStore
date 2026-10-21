@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 
+#include <filesystem>
 #include <span>
 #include <string>
 #include <vector>
@@ -161,6 +162,15 @@ class FileSystemAdapter {
                                      request.offset));
         }
         return results;
+    }
+
+    // Resolve in the backend's namespace; remote adapters must override this.
+    virtual tl::expected<std::string, ErrorCode> CanonicalPath(
+        const std::string& path) {
+        std::error_code ec;
+        auto resolved = std::filesystem::canonical(path, ec);
+        if (ec) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        return resolved.string();
     }
 
     // === Lifecycle ===

@@ -323,6 +323,15 @@ TEST(ImmutableBucketAllocatorTest, RejectsExistingBucketArtifacts) {
     EXPECT_EQ(initialized.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST(ImmutableBucketAllocatorTest, CogniStoreRequiresBucketAllocator) {
+    TempDir dir;
+    auto config = BucketConfig(dir);
+    config.fs_adapter_type = "cognistore";
+    EXPECT_TRUE(config.ValidateForAllocator());
+    config.allocator_type = "shard";
+    EXPECT_FALSE(config.ValidateForAllocator());
+}
+
 TEST(ImmutableBucketAllocatorTest, ConcurrentAllocationDoesNotOverlap) {
     TempDir dir;
     auto config = BucketConfig(dir);
