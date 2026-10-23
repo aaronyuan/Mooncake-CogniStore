@@ -70,6 +70,21 @@ with `register_buffer`.
   - Controls how many objects are written by the prepare phase
   - `0` means reuse `nr-objects`
 
+## Reading a dataset written by another process
+
+For `read_perf`, `--prepare-mode none` performs no writes. It reads the key range
+starting at `--object-id-start`, with `--prepare-objects` entries (or
+`--nr-objects` when `prepare-objects=0`). Use the same key prefix, key size,
+value size, and verification pattern as the writer. Missing keys are reported
+as misses; they are not silently excluded from the dataset.
+
+Each benchmark invocation is one process. `--numjobs * --iodepth` controls
+threads within that process. To use multiple reader processes, launch separate
+invocations with distinct `--local-hostname` endpoints and output paths, pointing
+to the same Master and dataset. A `read_perf --prepare-mode none` invocation
+initializes its client before waiting at an optional phase gap. An external
+launcher can use file-mode phase gaps to release initialized readers together.
+
 ## Phase Gap
 
 Phase gaps are used when an external tool needs time to inject a fault or do an

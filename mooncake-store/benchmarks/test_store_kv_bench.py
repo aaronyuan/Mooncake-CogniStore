@@ -110,6 +110,61 @@ class MetadataWorkloadModelTest(unittest.TestCase):
         self.assertFalse(model.is_present(4))
 
 
+class ExistingDatasetReadTest(unittest.TestCase):
+    def test_external_dataset_is_read_without_put_and_after_setup(self):
+        for prepare_objects, count in ((0, 3), (5, 5)):
+            with self.subTest(prepare_objects=prepare_objects):
+                args = bench.build_parser().parse_args([
+                    "--scenario", "read_perf", "--prepare-mode", "none",
+                    "--nr-objects", "3", "--prepare-objects", str(prepare_objects),
+                    "--object-id-start", "7", "--value-size", "512",
+                    "--verify", "--pattern", "x",
+                ])
+                store = Mock()
+                store.setup.return_value = 0
+                store.get.return_value = b"x" * 512
+                with patch.object(bench, "MooncakeDistributedStore", return_value=store):
+                    runner = bench.BenchmarkRunner(args)
+
+                    def ready(_label):
+                        store.setup.assert_called_once()
+                        store.get.assert_not_called()
+
+                    try:
+                        with patch.object(runner, "_phase_gap", side_effect=ready) as gap:
+                            phases = runner.run()
+                        gap.assert_called_once_with("main_run")
+                    finally:
+                        runner.close()
+                self.assertEqual([p.name for p in phases], ["read_perf"])
+                self.assertEqual(phases[0].successful_kvs, count)
+                self.assertEqual(phases[0].verify_failures, 0)
+                self.assertEqual([c.args[0] for c in store.get.call_args_list], [
+                    bench.make_key(args.key_prefix, args.key_size, i)
+                    for i in range(7, 7 + count)
+                ])
+                store.put.assert_not_called()
+                store.put_batch.assert_not_called()
+                store.close.assert_called_once()
+
+    def test_missing_external_keys_fail_verification(self):
+        store = Mock()
+        store.setup.return_value = 0
+        store.get.return_value = b""
+        with (
+            patch.object(bench, "MooncakeDistributedStore", return_value=store),
+            patch.object(sys, "argv", [
+                "store_kv_bench.py", "--scenario", "read_perf",
+                "--prepare-mode", "none", "--nr-objects", "2",
+                "--verify", "--pattern", "x",
+            ]),
+        ):
+            self.assertEqual(bench.main(), 21)
+        self.assertEqual(store.get.call_count, 2)
+        store.put.assert_not_called()
+        store.close.assert_called_once()
+
+
 class OutputTest(unittest.TestCase):
     def test_journal_replay_summary_and_sampling(self):
         root = Path(f"/tmp/mooncake-kv-bench-test-{os.getpid()}")

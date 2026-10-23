@@ -1365,6 +1365,12 @@ class BenchmarkRunner:
 
     def _maybe_prepare_dataset(self) -> Optional[PhaseStats]:
         if self.args.prepare_mode == "none":
+            if self.args.scenario == "read_perf":
+                # Another process may have populated this deterministic key range.
+                start = self.args.object_id_start
+                self.dataset.mark_prepared(range(start, start + self._prepare_budget()))
+                self._make_sessions()
+                self._phase_gap("main_run")
             return None
         if self.args.prepare_mode == "write" or self.args.scenario in {
             "read_perf",
