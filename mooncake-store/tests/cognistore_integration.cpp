@@ -183,6 +183,67 @@ void AdapterTest(const std::string& root) {
     std::cout << "COGNISTORE_ADAPTER_PASS pid=" << getpid()
               << " verified_bytes=" << expected.size() << '\n';
 }
+// Exercise a full SDK batch plus a short tail, scatter buffers, failed prep,
+// short EOF, and ordered overlapping writes against the real storage cluster.
+void BatchIoTest(const std::string& root) {
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "batch init");
+    const auto path = root + "/value";
+    constexpr size_t capacity = 2 * 1024 * 1024;
+    constexpr size_t count = 11, size = 65536;
+    Take(adapter.PreallocateFile(path, capacity), "batch preallocate");
+    int fd = Take(adapter.OpenExistingFile(path), "batch writer");
+    int ro = Take(adapter.OpenExistingFileForRead(path), "batch reader");
+    std::array<std::string, count> values, output;
+    std::array<std::array<iovec, 2>, count> inputs, outputs;
+    std::array<FdIoRequest, count> writes, reads;
+    for (size_t i = 0; i < count; ++i) {
+        values[i] = Pattern(size, i);
+        output[i].resize(size);
+        inputs[i] = {{{values[i].data(), 79}, {values[i].data() + 79, size - 79}}};
+        outputs[i] = {{{output[i].data(), 113}, {output[i].data() + 113, size - 113}}};
+        writes[i] = {fd, inputs[i].data(), 2, int64_t(33 + i * (size + 4096))};
+        reads[i] = {ro, outputs[i].data(), 2, writes[i].offset};
+    }
+    auto written = adapter.BatchWriteAt(writes);
+    Check(written.size() == count, "batch write count");
+    for (auto& result : written) Check(Take(result, "batch write") == size, "batch short write");
+    auto verify = [&] {
+        auto read = adapter.BatchReadAt(reads);
+        Check(read.size() == count, "batch read count");
+        for (size_t i = 0; i < count; ++i)
+            Check(Take(read[i], "batch read") == size && output[i] == values[i], "batch bytes mismatch");
+    };
+    verify();
+    // The read-only handle fails during SDK prep after a valid prep. The
+    // accepted entries still have to finish, including the short SDK batch.
+    std::array<FdIoRequest, 3> mixed{writes[0], writes[1], writes[2]};
+    mixed[1].fd = ro;
+    auto partial = adapter.BatchWriteAt(mixed);
+    Check(partial.size() == 3 && partial[0] && !partial[1] && partial[2], "batch failed-prep contract");
+    verify();
+    std::array<char, 32> tail{};
+    iovec tail_iov{tail.data(), tail.size()};
+    std::array<FdIoRequest, 3> eof{{{ro, &tail_iov, 1, capacity - 7}, reads[0], reads[1]}};
+    eof[1].fd = -1;
+    auto short_read = adapter.BatchReadAt(eof);
+    Check(short_read.size() == 3 && short_read[0] && *short_read[0] == 7 &&
+              !short_read[1] && short_read[2] && *short_read[2] == size && output[1] == values[1],
+          "batch short EOF or per-item error");
+    Check(std::all_of(tail.begin(), tail.begin() + 7, [](char c) { return c == 0; }), "batch EOF bytes");
+    std::array<FdIoRequest, 2> overlap{writes[0], writes[1]};
+    overlap[1].offset = overlap[0].offset;
+    auto ordered = adapter.BatchWriteAt(overlap);
+    Check(ordered.size() == 2 && ordered[0] && ordered[1], "batch overlap write");
+    // Do not modify the backing source buffers until all I/O completes.
+    values[0] = values[1];
+    verify();
+    Take(adapter.CloseFile(fd), "batch close writer");
+    verify();
+    Take(adapter.CloseFile(ro), "batch close reader");
+    Take(adapter.DeleteFile(path), "batch cleanup");
+    std::cout << "COGNISTORE_BATCH_IO_PASS objects=11 scatter=2 partial_prep=1 short_eof=1 overlap=1" << std::endl;
+}
 // Check the overwritten bytes and both retained patterned sides, then repeat
 // through a new read-only handle after writer close/promotion.
 void SmallIoTest(const std::string& root) {
@@ -446,11 +507,13 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     try {
         Check(argc >= 3,
-              "usage: cognistore_integration adapter/small-io ROOT | put/read ROOT "
+              "usage: cognistore_integration adapter/small-io/batch-io ROOT | put/read ROOT "
               "MASTER | concurrent-writer/concurrent-reader ROOT CONTROL_DIR VALUE_SIZE");
         std::string mode = argv[1], root = argv[2];
         if (mode == "adapter")
             AdapterTest(root);
+        else if (mode == "batch-io")
+            BatchIoTest(root);
         else if (mode == "small-io")
             SmallIoTest(root);
         else if (mode == "concurrent-writer" || mode == "concurrent-reader") {

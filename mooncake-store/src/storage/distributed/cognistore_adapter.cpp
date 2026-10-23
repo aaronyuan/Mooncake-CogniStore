@@ -1,6 +1,7 @@
 #include "storage/distributed/cognistore_adapter.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 namespace mooncake {
 namespace {
 constexpr size_t kBufferSize = 1024 * 1024;
+constexpr size_t kBatchEntries = 8;
 ErrorCode Translate(int64_t rc, ErrorCode fallback) {
     if (rc == -ENOENT) return ErrorCode::FILE_NOT_FOUND;
     if (rc == -EINVAL) return ErrorCode::INVALID_PARAMS;
@@ -54,7 +56,7 @@ struct CogniStoreFsAdapter::Runtime {
     pid_t pid{::getpid()};
     cogni_sdk sdk{};
     cogni_sdk_iov iov{};
-    cogni_sdk_ior read{}, write{};
+    cogni_sdk_ior read{}, write{}, batch_read{}, batch_write{};
     void* buffer{nullptr};
     bool poisoned{false};
 
@@ -63,9 +65,10 @@ struct CogniStoreFsAdapter::Runtime {
         if (cogni_sdk_abi_version() != COGNI_SDK_ABI_VERSION) return -ENOTSUP;
         int rc = cogni_sdk_create(&sdk, path.c_str(), nullptr);
         if (rc) return rc;
-        if (posix_memalign(&buffer, 4096, kBufferSize)) return -ENOMEM;
+        if (posix_memalign(&buffer, 4096, kBufferSize * kBatchEntries))
+            return -ENOMEM;
         // Native registration verifies the NUMA home of resident payload pages.
-        std::memset(buffer, 0, kBufferSize);
+        std::memset(buffer, 0, kBufferSize * kBatchEntries);
         int numa = -1;
         if (const char* setting =
                 std::getenv("MOONCAKE_COGNISTORE_NUMA_NODE")) {
@@ -75,16 +78,26 @@ struct CogniStoreFsAdapter::Runtime {
                 return -EINVAL;
             numa = static_cast<int>(parsed);
         }
-        rc = cogni_sdk_iov_register(&sdk, &iov, buffer, kBufferSize,
+        rc = cogni_sdk_iov_register(&sdk, &iov, buffer, kBufferSize * kBatchEntries,
                                     kBufferSize, numa);
         if (rc) return rc;
         rc = cogni_sdk_ior_create(&sdk, &read, 1, 1, 1, 1, 30000, 0);
         if (rc) return rc;
-        return cogni_sdk_ior_create(&sdk, &write, 1, 0, 1, 1, 30000, 0);
+        rc = cogni_sdk_ior_create(&sdk, &write, 1, 0, 1, 1, 30000, 0);
+        if (rc) return rc;
+        // Negative depth flushes an incomplete batch after 1 ms. Positive
+        // depth would leave the final short batch waiting for missing entries.
+        rc = cogni_sdk_ior_create(&sdk, &batch_read, kBatchEntries, 1,
+                                  -int(kBatchEntries), 1, 1, 0);
+        if (rc) return rc;
+        return cogni_sdk_ior_create(&sdk, &batch_write, kBatchEntries, 0,
+                                    -int(kBatchEntries), 1, 1, 0);
     }
     ~Runtime() {
         // Fail closed rather than freeing buffers still owned by an unknown
         // I/O.
+        if (batch_read.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&batch_read), 0);
+        if (batch_write.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&batch_write), 0);
         if (read.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&read), 0);
         if (write.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&write), 0);
         if (iov.private_data) CHECK_EQ(cogni_sdk_iov_release(&iov), 0);
@@ -380,6 +393,141 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::WriteAt(int fd,
 tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::ReadAt(int fd, iovec* v,
                                                             int n, int64_t o) {
     return Transfer(fd, v, n, o, true);
+}
+
+std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchWriteAt(
+    std::span<const FdIoRequest> requests) {
+    return BatchTransfer(requests, false);
+}
+std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchReadAt(
+    std::span<const FdIoRequest> requests) {
+    return BatchTransfer(requests, true);
+}
+std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
+    std::span<const FdIoRequest> requests, bool read) {
+    const auto failure =
+        read ? ErrorCode::FILE_READ_FAIL : ErrorCode::FILE_WRITE_FAIL;
+    std::vector<tl::expected<size_t, ErrorCode>> results(
+        requests.size(), tl::make_unexpected(failure));
+    for (size_t start = 0; start < requests.size(); start += kBatchEntries) {
+        const auto wave = requests.subspan(
+            start, std::min(kBatchEntries, requests.size() - start));
+        std::array<size_t, kBatchEntries> lengths{};
+        bool eligible = wave.size() > 1;
+        for (size_t i = 0; i < wave.size() && eligible; ++i) {
+            const auto& r = wave[i];
+            eligible = r.offset >= 0 && r.iovcnt > 0 && r.iov;
+            for (int j = 0; j < r.iovcnt && eligible; ++j) {
+                eligible = (!r.iov[j].iov_len || r.iov[j].iov_base) &&
+                           r.iov[j].iov_len <= kBufferSize - lengths[i];
+                if (eligible) lengths[i] += r.iov[j].iov_len;
+            }
+            eligible = eligible && lengths[i] &&
+                       lengths[i] <= size_t(INT64_MAX - r.offset);
+            // Preserve the scalar ordering contract for overlapping writes.
+            for (size_t j = 0; !read && j < i && eligible; ++j) {
+                if (r.fd == wave[j].fd && r.offset < wave[j].offset + int64_t(lengths[j]) &&
+                    wave[j].offset < r.offset + int64_t(lengths[i])) eligible = false;
+            }
+        }
+        // Oversized, empty or overlapping requests keep the scalar semantics.
+        if (!eligible || !runtime_) {
+            for (size_t i = 0; i < wave.size(); ++i) {
+                const auto& r = wave[i];
+                results[start + i] = Transfer(r.fd, r.iov, r.iovcnt, r.offset, read);
+            }
+            continue;
+        }
+        std::lock_guard lock(runtime_->mutex);
+        if (runtime_->poisoned) break;
+        auto* ring = read ? &runtime_->batch_read : &runtime_->batch_write;
+        std::array<int, kBatchEntries> indices;
+        indices.fill(-1);
+        size_t pending = 0;
+        for (size_t i = 0; i < wave.size(); ++i) {
+            const auto& r = wave[i];
+            auto file = files_.find(r.fd);
+            if (file == files_.end()) {
+                results[start + i] = tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
+                continue;
+            }
+            auto* buffer = static_cast<char*>(runtime_->buffer) + i * kBufferSize;
+            size_t offset = 0;
+            if (!read) {
+                for (int j = 0; j < r.iovcnt; ++j) {
+                    if (r.iov[j].iov_len)
+                        std::memcpy(buffer + offset, r.iov[j].iov_base, r.iov[j].iov_len);
+                    offset += r.iov[j].iov_len;
+                }
+            }
+            int index = cogni_sdk_prep_io(ring, &file->second, &runtime_->iov,
+                                         r.offset, i * kBufferSize, lengths[i], nullptr);
+            if (index < 0) {
+                results[start + i] = tl::make_unexpected(Translate(index, failure));
+            } else {
+                indices[i] = index;
+                ++pending;
+            }
+        }
+        // Even if a later prep fails, drain every accepted entry before the
+        // registered slots can be reused or their file handles can be closed.
+        if (pending && cogni_sdk_submit_ios(ring)) runtime_->poisoned = true;
+        while (pending && !runtime_->poisoned) {
+            std::array<cogni_sdk_cqe, kBatchEntries> cqes{};
+            int count = cogni_sdk_wait_for_ios(ring, cqes.data(), pending, 1, nullptr);
+            if (count <= 0 || size_t(count) > pending) {
+                runtime_->poisoned = true;
+                break;
+            }
+            for (int j = 0; j < count; ++j) {
+                auto found = std::find(indices.begin(), indices.end(), cqes[j].index);
+                if (cqes[j].index < 0 || found == indices.end()) {
+                    runtime_->poisoned = true;
+                    break;
+                }
+                const auto i = size_t(found - indices.begin());
+                *found = -1;
+                --pending;
+                const auto n = cqes[j].result;
+                if (n < 0) results[start + i] = tl::make_unexpected(Translate(n, failure));
+                else if (uint64_t(n) > lengths[i]) runtime_->poisoned = true;
+                else if (!read && size_t(n) != lengths[i]) results[start + i] = tl::make_unexpected(failure);
+                else results[start + i] = size_t(n);
+            }
+        }
+        if (runtime_->poisoned) {
+            for (size_t i = start; i < results.size(); ++i)
+                results[i] = tl::make_unexpected(failure);
+            break;
+        }
+        for (size_t i = 0; i < wave.size(); ++i) {
+            if (!results[start + i]) continue;
+            const auto& r = wave[i];
+            if (read) {
+                size_t copied = 0;
+                auto* buffer = static_cast<char*>(runtime_->buffer) + i * kBufferSize;
+                for (int j = 0; j < r.iovcnt && copied < *results[start + i]; ++j) {
+                    size_t n = std::min(r.iov[j].iov_len, *results[start + i] - copied);
+                    if (n) std::memcpy(r.iov[j].iov_base, buffer + copied, n);
+                    copied += n;
+                }
+            } else {
+                bool synced = false;
+                for (size_t j = 0; j < i; ++j) {
+                    if (wave[j].fd == r.fd && results[start + j]) synced = true;
+                }
+                if (synced) continue;
+                int rc = cogni_sdk_file_fsync(&files_.at(r.fd));
+                if (rc) {
+                    for (size_t j = i; j < wave.size(); ++j) {
+                        if (wave[j].fd == r.fd && results[start + j])
+                            results[start + j] = tl::make_unexpected(Translate(rc, failure));
+                    }
+                }
+            }
+        }
+    }
+    return results;
 }
 
 tl::expected<void, ErrorCode> CogniStoreFsAdapter::PreallocateFile(
