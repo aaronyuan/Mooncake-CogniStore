@@ -1,6 +1,7 @@
 #pragma once
 
 #include <csignal>
+#include <mutex>
 
 #include <string>
 #include <boost/functional/hash.hpp>
@@ -375,6 +376,8 @@ class WrappedMasterService {
 
    private:
     MasterService master_service_;
+    // Keep concurrent Put RPCs from interleaving a batch's bucket extents.
+    std::mutex dfs_put_start_mutex_;
 };
 
 class RpcWorkerPool;

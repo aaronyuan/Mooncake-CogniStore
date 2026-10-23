@@ -137,6 +137,7 @@ class MasterService {
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
+    bool UsesBucketDfsAllocator() const { return bucket_allocator_ != nullptr; }
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
         const TenantId& tenant_id) const;

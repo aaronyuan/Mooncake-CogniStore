@@ -429,6 +429,9 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
                                const std::string& tenant_id) {
+    std::unique_lock allocation(dfs_put_start_mutex_, std::defer_lock);
+    if (config.dfs_replica_num > 0 && master_service_.UsesBucketDfsAllocator())
+        allocation.lock();
     auto result = execute_rpc(
         "PutStart",
         [&] {
@@ -505,6 +508,13 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const ReplicateConfig& config,
                                     const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchPutStart");
+    // Acquire before per-key metadata locks. The allocator already serializes
+    // individual extents; holding this gate for a Put batch keeps adjacent KV
+    // ranges together so clients can issue full-stripe I/O. Per-key errors and
+    // publication remain unchanged; memory-only Put RPCs do not take the gate.
+    std::unique_lock allocation(dfs_put_start_mutex_, std::defer_lock);
+    if (config.dfs_replica_num > 0 && master_service_.UsesBucketDfsAllocator())
+        allocation.lock();
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);

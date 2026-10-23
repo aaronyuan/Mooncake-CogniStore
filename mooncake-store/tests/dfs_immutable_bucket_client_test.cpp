@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -41,6 +42,7 @@ class FailingBucketPosixAdapter : public PosixFsAdapter {
 class DfsImmutableBucketClientTest : public ::testing::Test {
    protected:
     virtual int MaxBucketCount() const { return 2; }
+    virtual uint64_t BucketCapacity() const { return 4096; }
     virtual uint64_t DefaultKvLeaseTtl() const { return 0; }
 
     void SetUp() override {
@@ -53,7 +55,8 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_ALLOCATOR", "bucket");
-        SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY", "4096");
+        SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY",
+               std::to_string(BucketCapacity()));
         SetEnv("MOONCAKE_DFS_MAX_BUCKET_COUNT",
                std::to_string(MaxBucketCount()));
         SetEnv("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -83,7 +86,7 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         distributed_config.fs_adapter_type = "posix";
         distributed_config.allocator_type = "bucket";
         distributed_config.alignment = 4096;
-        distributed_config.bucket_capacity = 4096;
+        distributed_config.bucket_capacity = BucketCapacity();
         distributed_config.max_bucket_count = MaxBucketCount();
         auto adapter = std::make_unique<FailingBucketPosixAdapter>();
         adapter_ = adapter.get();
@@ -154,6 +157,87 @@ class DfsImmutableBucketLruClientTest : public DfsImmutableBucketClientTest {
     int MaxBucketCount() const override { return 3; }
     uint64_t DefaultKvLeaseTtl() const override { return 50; }
 };
+
+class DfsBucketBatchLocalityTest : public DfsImmutableBucketClientTest {
+   protected:
+    int MaxBucketCount() const override { return 4; }
+    uint64_t BucketCapacity() const override { return 1024 * 1024; }
+};
+
+TEST_F(DfsBucketBatchLocalityTest, ConcurrentPutBatchesKeepAdjacentExtents) {
+    constexpr size_t jobs = 8, rounds = 3, count = 32;
+    using Result =
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    std::vector<std::vector<Result>> results(jobs * rounds);
+    std::barrier start(jobs + 1);
+    std::vector<Result> singles;
+    std::vector<std::thread> threads;
+    for (size_t job = 0; job < jobs; ++job) {
+        threads.emplace_back([&, job] {
+            const auto client = generate_uuid();
+            auto config = DfsConfig();
+            config.replica_num = 0;
+            for (size_t round = 0; round < rounds; ++round) {
+                const auto batch = round * jobs + job;
+                std::vector<std::string> keys;
+                for (size_t i = 0; i < count; ++i)
+                    keys.push_back("batch_" + std::to_string(batch) + "_" +
+                                   std::to_string(i));
+                config.prefer_alloc_in_same_node = round % 2;
+                start.arrive_and_wait();
+                results[batch] = master_.service()->BatchPutStart(
+                    client, keys, std::vector<uint64_t>(count, 4096), config);
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        const auto client = generate_uuid();
+        auto config = DfsConfig();
+        config.replica_num = 0;
+        for (size_t round = 0; round < rounds; ++round) {
+            start.arrive_and_wait();
+            for (size_t i = 0; i < count; ++i)
+                singles.push_back(master_.service()->PutStart(
+                    client, "single_" + std::to_string(round * count + i),
+                    4096, config));
+        }
+    });
+    for (auto& thread : threads) thread.join();
+    for (const auto& single : singles) ASSERT_TRUE(single);
+    for (const auto& batch : results) {
+        ASSERT_EQ(batch.size(), count);
+        for (size_t i = 0; i < count; ++i) {
+            ASSERT_TRUE(batch[i]) << toString(batch[i].error());
+            ASSERT_EQ(batch[i]->size(), 1);
+            ASSERT_TRUE(batch[i]->front().is_dfs_replica());
+            if (!i) continue;
+            const auto& prev = batch[i - 1]->front().get_dfs_descriptor();
+            const auto& next = batch[i]->front().get_dfs_descriptor();
+            if (next.file_path == prev.file_path) {
+                EXPECT_EQ(next.offset, prev.offset + prev.aligned_size);
+            } else {
+                EXPECT_EQ(prev.offset + prev.aligned_size, BucketCapacity());
+                EXPECT_EQ(next.offset, 0);
+            }
+        }
+    }
+    // Locality must retain the existing per-key success/failure contract.
+    auto config = DfsConfig();
+    config.replica_num = 0;
+    const auto client = generate_uuid();
+    ASSERT_TRUE(master_.service()->PutStart(client, "existing", 4096, config));
+    auto partial = master_.service()->BatchPutStart(
+        client, {"existing", "fresh"}, {4096, 4096}, config);
+    ASSERT_EQ(partial.size(), 2);
+    ASSERT_FALSE(partial[0]);
+    EXPECT_EQ(partial[0].error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    EXPECT_TRUE(partial[1]);
+    auto malformed = master_.service()->BatchPutStart(
+        client, {"bad_lengths"}, {}, config);
+    ASSERT_EQ(malformed.size(), 1);
+    ASSERT_FALSE(malformed[0]);
+    EXPECT_EQ(malformed[0].error(), ErrorCode::INVALID_PARAMS);
+}
 
 TEST_F(DfsImmutableBucketClientTest, PutReturnsAfterWriteAndFailureRevokes) {
     std::string value(4096, 'A');
