@@ -7,7 +7,8 @@
 
 namespace mooncake {
 // Initial synchronous, copy-based bridge to the process-local SDK C ABI.
-// Batch and stale-fd retry capabilities intentionally remain disabled.
+// Bucket batching reuses handles; SDK transfers are still synchronous.
+// Stale-fd retries remain disabled.
 class CogniStoreFsAdapter final : public FileSystemAdapter {
    public:
     CogniStoreFsAdapter();
@@ -33,6 +34,7 @@ class CogniStoreFsAdapter final : public FileSystemAdapter {
     tl::expected<size_t, ErrorCode> WriteAt(int, const iovec*, int,
                                             int64_t) override;
     tl::expected<size_t, ErrorCode> ReadAt(int, iovec*, int, int64_t) override;
+    bool SupportsBatchIo() const override { return true; }
     const char* GetName() const override { return "cognistore"; }
 
    private:

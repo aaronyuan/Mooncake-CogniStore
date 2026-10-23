@@ -643,7 +643,7 @@ DistributedStorageBackend::BatchWrite(
     // Storage layout: bucket I/O uses temporary fds and completes short writes;
     // shard I/O reuses cached fds and fails short writes.
     const bool bucket_mode = UsesBucketAllocator();
-    // Execution mode: adapters that opt in (currently 3FS) collect validated
+    // Execution mode: adapters that opt in collect validated
     // writes for submission after the loop. Other adapters (including POSIX)
     // execute each write in the loop, preserving per-request bucket handles
     // and shard I/O locking.
@@ -731,7 +731,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     // Storage layout: bucket I/O uses temporary fds and completes short reads;
     // shard I/O reuses cached fds and fails short reads.
     const bool bucket_mode = UsesBucketAllocator();
-    // Execution mode: adapters that opt in (currently 3FS) collect validated
+    // Execution mode: adapters that opt in collect validated
     // reads for submission after the loop. Other adapters (including POSIX)
     // execute each read in the loop, preserving per-request bucket handles
     // and shard I/O locking.

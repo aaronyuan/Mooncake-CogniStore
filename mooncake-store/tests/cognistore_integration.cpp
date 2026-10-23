@@ -144,9 +144,33 @@ void AdapterTest(const std::string& root) {
         Check(read.size() == 1, "bucket read result count");
         Take(read[0], "bucket read");
         Check(output == value, "bucket bytes mismatch");
+        // Two offsets in one bucket and a second bucket share a batch. The
+        // backend must keep handles alive until every operation completes.
+        auto same = Take(allocator.Allocate("same", 16), "allocate same bucket");
+        auto other = Take(allocator.Allocate("other", 16), "allocate other bucket");
+        Check(same.file_path == descriptor.file_path &&
+                  other.file_path != descriptor.file_path,
+              "unexpected batch bucket layout");
+        auto b = Pattern(16, 124), c = Pattern(16, 125);
+        auto writes = backend.BatchWrite({
+            {"entry", descriptor, {{value.data(), value.size()}}},
+            {"same", same, {{b.data(), b.size()}}},
+            {"other", other, {{c.data(), c.size()}}}});
+        Check(writes.size() == 3, "multi-bucket write result count");
+        for (auto& result : writes) Take(result, "multi-bucket write");
+        std::string out_b(16, '\0'), out_c(16, '\0');
+        auto reads = backend.BatchRead({
+            {"entry", descriptor, {{output.data(), output.size()}}},
+            {"same", same, {{out_b.data(), out_b.size()}}},
+            {"other", other, {{out_c.data(), out_c.size()}}}});
+        Check(reads.size() == 3, "multi-bucket read result count");
+        for (auto& result : reads) Take(result, "multi-bucket read");
+        Check(output == value && out_b == b && out_c == c,
+              "multi-bucket bytes mismatch");
         CogniStoreFsAdapter remover;
         Take(remover.Init(distributed.fsdir), "remover init");
         Take(remover.DeleteFile(descriptor.file_path), "remove bucket");
+        Take(remover.DeleteFile(other.file_path), "remove other bucket");
         auto stale = backend.BatchRead(
             {{"entry", descriptor, {{output.data(), output.size()}}}});
         Check(stale.size() == 1 && !stale[0] &&

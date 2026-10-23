@@ -138,8 +138,7 @@ class ZeroProgressPosixAdapter : public CountingPosixAdapter {
 };
 
 // Model adapters with access-mode-dependent close behavior using real POSIX
-// descriptors. Exercise both backend dispatch paths, even if CogniStore
-// currently opts out of batched I/O.
+// descriptors. Exercise both scalar and batch backend dispatch paths.
 class AccessModePosixAdapter : public PosixFsAdapter {
    public:
     explicit AccessModePosixAdapter(bool batch_io) : batch_io_(batch_io) {}
