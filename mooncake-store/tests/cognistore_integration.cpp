@@ -4,6 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <set>
 #include <stdexcept>
@@ -48,6 +50,9 @@ void AdapterTest(const std::string& root) {
     auto missing = first.OpenExistingFile(path);
     Check(!missing && missing.error() == ErrorCode::FILE_NOT_FOUND,
           "missing open created a file");
+    auto missing_read = first.OpenExistingFileForRead(path);
+    Check(!missing_read && missing_read.error() == ErrorCode::FILE_NOT_FOUND,
+          "missing read open created a file");
     constexpr size_t capacity = 2 * 1024 * 1024 + 17;
     Take(first.PreallocateFile(path, capacity), "preallocate");
     Check(Take(first.GetFileSize(path), "size") == capacity, "wrong capacity");
@@ -65,7 +70,8 @@ void AdapterTest(const std::string& root) {
     Take(first.CloseFile(fd), "close writer");
     Take(first.Shutdown(), "release first adapter");
     // The remaining adapter must keep the single process runtime alive.
-    fd = Take(second.OpenExistingFile(path), "reopen");
+    fd = Take(second.OpenExistingFileForRead(path), "reopen read-only");
+    Check(!second.WriteAt(fd, parts, 2, 33), "read-only handle accepted write");
     std::string got(expected.size(), '\0');
     iovec output{got.data(), got.size()};
     Check(Take(second.ReadAt(fd, &output, 1, 33), "read") == got.size() &&
@@ -152,6 +158,161 @@ void AdapterTest(const std::string& root) {
     }
     std::cout << "COGNISTORE_ADAPTER_PASS pid=" << getpid()
               << " verified_bytes=" << expected.size() << '\n';
+}
+// Check the overwritten bytes and both retained patterned sides, then repeat
+// through a new read-only handle after writer close/promotion.
+void SmallIoTest(const std::string& root) {
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "small IO init");
+    for (size_t length : {size_t(16), size_t(4096), size_t(65536), size_t(65537)}) {
+        const auto path = root + "/value_" + std::to_string(length);
+        Take(adapter.PreallocateFile(path, 2 * 1024 * 1024), "small IO preallocate");
+        int fd = Take(adapter.OpenExistingFile(path), "small IO writer");
+        auto initial = Pattern(1024 * 1024, 42);
+        iovec seed{initial.data(), initial.size()};
+        Check(Take(adapter.WriteAt(fd, &seed, 1, 0), "small IO seed") ==
+                  initial.size(),
+              "small IO short seed");
+        auto value = Pattern(length, length);
+        iovec input{value.data(), value.size()};
+        Check(Take(adapter.WriteAt(fd, &input, 1, 33), "small IO write") == length,
+              "small IO short write");
+        auto verify = [&](const std::string& phase, size_t read_length) {
+            auto expected = initial.substr(0, read_length);
+            expected.replace(33, length, value);
+            std::string got(read_length, char(0xcd));
+            iovec output{got.data(), got.size()};
+            Check(Take(adapter.ReadAt(fd, &output, 1, 0), "small IO read") ==
+                      got.size(),
+                  "small IO short read");
+            Check(got == expected, "small IO mismatch " + phase + " size=" +
+                                       std::to_string(length));
+        };
+        verify("before-close", length + 66);
+        verify("before-close", 1024 * 1024);
+        Take(adapter.CloseFile(fd), "small IO close writer");
+        fd = Take(adapter.OpenExistingFileForRead(path), "small IO reader");
+        verify("after-close", length + 66);
+        verify("after-close", 1024 * 1024);
+        Take(adapter.CloseFile(fd), "small IO close reader");
+        Take(adapter.DeleteFile(path), "small IO cleanup");
+    }
+    std::cout << "COGNISTORE_SMALL_IO_PASS cases=4 phases=2 read_sizes=2"
+              << std::endl;
+}
+// Invoked in separate processes by run-concurrent.py. Control markers live on
+// local disk, never in the bucket under test. Use 4 KiB values for the TCP
+// fixture's 256 KiB stripe, or 1 MiB values for Wuxi's 16 MiB stripe.
+void ConcurrentBucketTest(bool writer, const std::string& root,
+                          const std::filesystem::path& control, size_t value_size) {
+    Check(value_size == 4096 || value_size == 1048576, "unsupported test value size");
+    auto signal = [&](const std::string& name) {
+        std::ofstream marker(control / name);
+        Check(marker.good(), "cannot signal " + name);
+    };
+    auto wait = [&](const std::string& name) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(120);
+        while (!std::filesystem::exists(control / name)) {
+            Check(std::chrono::steady_clock::now() < deadline,
+                  "timed out waiting for " + name);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+    if (!writer) wait("writer-ready");
+    DistributedStorageConfig config;
+    config.fsdir = root;
+    config.fs_adapter_type = "cognistore";
+    config.allocator_type = "bucket";
+    config.bucket_capacity = 16 * value_size;
+    config.alignment = 4096;
+    config.max_bucket_count = 1;
+    config.single_tenant = true;
+    config.eviction_enabled = false;
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "concurrent adapter init");
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(
+        file_config, config, std::make_unique<CogniStoreFsAdapter>());
+    Take(backend.Init(), "concurrent backend init");
+    const auto path = root + "/bucket_000000.data";
+    DistributedFSDescriptor stable{path, 0, value_size, value_size, 0};
+    auto original = Pattern(value_size, 0);
+    if (writer) {
+        Take(adapter.PreallocateFile(path, config.bucket_capacity),
+             "concurrent preallocate");
+        Take(backend.BatchWrite(
+                 {{"stable", stable, {{original.data(), original.size()}}}})[0],
+             "seed stable offset");
+        signal("writer-ready");
+        wait("reader-ready");
+    }
+    int read_fd = -1;
+    if (!writer) {
+        read_fd = Take(adapter.OpenExistingFileForRead(path), "long-lived reader");
+        auto invalid = Pattern(value_size, 99);
+        iovec denied{invalid.data(), invalid.size()};
+        Check(!adapter.WriteAt(read_fd, &denied, 1, 0),
+              "read-only concurrent handle accepted write");
+        std::string initial(value_size, '\0');
+        iovec initial_read{initial.data(), initial.size()};
+        Check(Take(adapter.ReadAt(read_fd, &initial_read, 1, 0), "read initial value") ==
+                  initial.size() && initial == original, "initial committed value mismatch");
+        signal("reader-ready");
+    }
+    size_t reads_during_writes = 0;
+    for (int round = 1; round <= 8; ++round) {
+        auto suffix = std::to_string(round);
+        DistributedFSDescriptor next{path, uint64_t(round) * value_size,
+                                     value_size, value_size, 0};
+        auto expected = Pattern(value_size, round);
+        if (writer) {
+            signal("writing-" + suffix);
+            wait("reading-" + suffix);
+            Take(backend.BatchWrite(
+                     {{suffix, next, {{expected.data(), expected.size()}}}})[0],
+                 "concurrent append " + suffix);
+            signal("committed-" + suffix);
+            wait("verified-" + suffix);
+        } else {
+            wait("writing-" + suffix);
+            signal("reading-" + suffix);
+            do {
+                std::string got(value_size, '\0');
+                Take(backend.BatchRead(
+                         {{"stable", stable, {{got.data(), got.size()}}}})[0],
+                     "read stable offset during append");
+                Check(got == original, "adjacent write corrupted stable offset");
+                ++reads_during_writes;
+            } while (!std::filesystem::exists(control / ("committed-" + suffix)));
+            // Reuse the O_RDONLY handle across all writer closes/promotions.
+            std::string got(value_size, '\0');
+            iovec output{got.data(), got.size()};
+            Check(Take(adapter.ReadAt(read_fd, &output, 1, next.offset),
+                       "read newly committed offset") == got.size() &&
+                      got == expected,
+                  "long-lived reader missed committed append " + suffix);
+            std::fill(got.begin(), got.end(), '\0');
+            Take(backend.BatchRead({{suffix, next, {{got.data(), got.size()}}}})[0],
+                 "Get newly committed offset");
+            Check(got == expected, "Get mismatch " + suffix);
+            signal("verified-" + suffix);
+        }
+    }
+    if (writer) {
+        wait("reader-closed");
+        Take(adapter.DeleteFile(path), "concurrent cleanup");
+        Check(!Take(adapter.FileExists(path), "concurrent cleanup exists"),
+              "concurrent bucket still exists");
+    } else {
+        Take(adapter.CloseFile(read_fd), "close long-lived reader");
+        signal("reader-closed");
+    }
+    std::cout << "COGNISTORE_CONCURRENT_PASS role=" << (writer ? "writer" : "reader")
+              << " pid=" << getpid() << " rounds=8 stable_reads=" << reads_during_writes
+              << " value_bytes=" << value_size
+              << " bucket_bytes=" << config.bucket_capacity
+              << " max_offset=" << 8 * value_size << std::endl;
 }
 const std::array<size_t, 10> sizes{1,       4095,    4096,    4097,    262144,
                                    1048576, 2097169, 3145728, 1048581, 3145728};
@@ -261,12 +422,18 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     try {
         Check(argc >= 3,
-              "usage: cognistore_integration adapter ROOT | put/read ROOT "
-              "MASTER");
+              "usage: cognistore_integration adapter/small-io ROOT | put/read ROOT "
+              "MASTER | concurrent-writer/concurrent-reader ROOT CONTROL_DIR VALUE_SIZE");
         std::string mode = argv[1], root = argv[2];
         if (mode == "adapter")
             AdapterTest(root);
-        else {
+        else if (mode == "small-io")
+            SmallIoTest(root);
+        else if (mode == "concurrent-writer" || mode == "concurrent-reader") {
+            Check(argc == 5, "control directory and value size required");
+            ConcurrentBucketTest(mode == "concurrent-writer", root, argv[3],
+                                 std::stoul(argv[4]));
+        } else {
             Check(argc == 4, "master address required");
             ClientTest(mode, argv[3], root);
         }

@@ -102,6 +102,14 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    // Read-only intent for existing bucket files. Adapters whose close path
+    // depends on access mode should override this; others retain their existing
+    // behavior. This must never create a missing file.
+    virtual tl::expected<int, ErrorCode> OpenExistingFileForRead(
+        const std::string& path) {
+        return OpenExistingFile(path);
+    }
+
     virtual tl::expected<void, ErrorCode> CloseFile(int /*fd*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }

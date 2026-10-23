@@ -64,6 +64,8 @@ struct CogniStoreFsAdapter::Runtime {
         int rc = cogni_sdk_create(&sdk, path.c_str(), nullptr);
         if (rc) return rc;
         if (posix_memalign(&buffer, 4096, kBufferSize)) return -ENOMEM;
+        // Native registration verifies the NUMA home of resident payload pages.
+        std::memset(buffer, 0, kBufferSize);
         int numa = -1;
         if (const char* setting =
                 std::getenv("MOONCAKE_COGNISTORE_NUMA_NODE")) {
@@ -286,6 +288,10 @@ tl::expected<int, ErrorCode> CogniStoreFsAdapter::OpenFile(
 tl::expected<int, ErrorCode> CogniStoreFsAdapter::OpenExistingFile(
     const std::string& path) {
     return Open(path, O_RDWR);
+}
+tl::expected<int, ErrorCode> CogniStoreFsAdapter::OpenExistingFileForRead(
+    const std::string& path) {
+    return Open(path, O_RDONLY);
 }
 tl::expected<void, ErrorCode> CogniStoreFsAdapter::CloseFile(int fd) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);

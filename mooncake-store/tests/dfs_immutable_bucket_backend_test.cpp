@@ -1,3 +1,5 @@
+#include <fcntl.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -134,6 +136,69 @@ class ZeroProgressPosixAdapter : public CountingPosixAdapter {
         return size_t{0};
     }
 };
+
+// Model adapters with access-mode-dependent close behavior using real POSIX
+// descriptors. Exercise both backend dispatch paths, even if CogniStore
+// currently opts out of batched I/O.
+class AccessModePosixAdapter : public PosixFsAdapter {
+   public:
+    explicit AccessModePosixAdapter(bool batch_io) : batch_io_(batch_io) {}
+    bool SupportsBatchIo() const override { return batch_io_; }
+    tl::expected<int, ErrorCode> OpenExistingFileForRead(
+        const std::string& path) override {
+        int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        return fd;
+    }
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int count,
+                                           int64_t offset) override {
+        EXPECT_EQ(::fcntl(fd, F_GETFL) & O_ACCMODE, O_RDONLY);
+        return PosixFsAdapter::ReadAt(fd, iov, count, offset);
+    }
+    tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov, int count,
+                                            int64_t offset) override {
+        EXPECT_EQ(::fcntl(fd, F_GETFL) & O_ACCMODE, O_RDWR);
+        return PosixFsAdapter::WriteAt(fd, iov, count, offset);
+    }
+
+   private:
+    bool batch_io_;
+};
+
+class ImmutableBucketAccessModeTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(ImmutableBucketAccessModeTest, ReadDoesNotChangeSubsequentWriteMode) {
+    TempDir dir;
+    auto config = MakeConfig(dir);
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    auto first = allocator.Allocate("first", 4);
+    auto second = allocator.Allocate("second", 4);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_EQ(first->file_path, second->file_path);
+    ASSERT_NE(first->offset, second->offset);
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(
+        file_config, config, std::make_unique<AccessModePosixAdapter>(GetParam()));
+    ASSERT_TRUE(backend.Init());
+    std::string a = "aaaa", b = "bbbb", output(4, '\0');
+    ASSERT_TRUE(backend.BatchWrite({{"first", *first, {{a.data(), 4}}}})[0]);
+    ASSERT_TRUE(backend.BatchRead({{"first", *first, {{output.data(), 4}}}})[0]);
+    EXPECT_EQ(output, a);
+    ASSERT_TRUE(backend.BatchWrite({{"second", *second, {{b.data(), 4}}}})[0]);
+    std::string other(4, '\0');
+    auto reads = backend.BatchRead({{"first", *first, {{output.data(), 4}}},
+                                   {"second", *second, {{other.data(), 4}}}});
+    ASSERT_EQ(reads.size(), 2u);
+    ASSERT_TRUE(reads[0]);
+    ASSERT_TRUE(reads[1]);
+    EXPECT_EQ(output, a);
+    EXPECT_EQ(other, b);
+}
+
+INSTANTIATE_TEST_SUITE_P(ScalarAndBatch, ImmutableBucketAccessModeTest,
+                         ::testing::Bool());
 
 class ImmutableBucketShortIoTest : public ::testing::TestWithParam<bool> {};
 

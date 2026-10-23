@@ -25,6 +25,8 @@ class CogniStoreFsAdapter final : public FileSystemAdapter {
         const std::string&) override;
     tl::expected<int, ErrorCode> OpenFile(const std::string&) override;
     tl::expected<int, ErrorCode> OpenExistingFile(const std::string&) override;
+    tl::expected<int, ErrorCode> OpenExistingFileForRead(
+        const std::string&) override;
     tl::expected<void, ErrorCode> CloseFile(int) override;
     tl::expected<void, ErrorCode> PreallocateFile(const std::string&,
                                                   uint64_t) override;
