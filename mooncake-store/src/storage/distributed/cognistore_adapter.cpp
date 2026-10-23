@@ -428,13 +428,15 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::ReadAt(int fd, iovec* v,
 }
 
 std::optional<std::vector<tl::expected<size_t, ErrorCode>>>
-CogniStoreFsAdapter::FullStripeWrite(std::span<const FdIoRequest> requests) {
+CogniStoreFsAdapter::CoalescedTransfer(
+    std::span<const FdIoRequest> requests, bool read) {
     if (requests.empty() || !runtime_) return std::nullopt;
     std::lock_guard lock(runtime_->mutex);
     auto file = files_.find(requests.front().fd);
-    if (file == files_.end() || !file->second.stripe_bytes) return std::nullopt;
+    if (file == files_.end() || (!read && !file->second.stripe_bytes))
+        return std::nullopt;
     const auto offset = requests.front().offset;
-    if (offset < 0 || uint64_t(offset) % file->second.stripe_bytes)
+    if (offset < 0 || (!read && uint64_t(offset) % file->second.stripe_bytes))
         return std::nullopt;
     std::vector<tl::expected<size_t, ErrorCode>> results;
     results.reserve(requests.size());
@@ -455,42 +457,71 @@ CogniStoreFsAdapter::FullStripeWrite(std::span<const FdIoRequest> requests) {
         if (!length) return std::nullopt;
         results.emplace_back(length);
     }
-    if (total % file->second.stripe_bytes || total > size_t(INT64_MAX - offset))
+    if ((!read && total % file->second.stripe_bytes) ||
+        (read && total <= kBufferSize) || total > size_t(INT64_MAX - offset))
         return std::nullopt;
+    const auto failure =
+        read ? ErrorCode::FILE_READ_FAIL : ErrorCode::FILE_WRITE_FAIL;
     auto fail = [&](int64_t rc) {
         for (auto& result : results)
-            result = tl::make_unexpected(Translate(rc, ErrorCode::FILE_WRITE_FAIL));
+            result = tl::make_unexpected(Translate(rc, failure));
         return results;
     };
     if (runtime_->poisoned) return fail(-EIO);
     int rc = runtime_->EnsureStripeBuffer();
     if (rc) return fail(rc);
-    size_t copied = 0;
-    for (const auto& r : requests) {
-        for (int i = 0; i < r.iovcnt; ++i) {
-            if (r.iov[i].iov_len)
-                std::memcpy(static_cast<char*>(runtime_->stripe_buffer) + copied,
-                            r.iov[i].iov_base, r.iov[i].iov_len);
-            copied += r.iov[i].iov_len;
+    if (!read) {
+        size_t copied = 0;
+        for (const auto& r : requests) {
+            for (int i = 0; i < r.iovcnt; ++i) {
+                if (r.iov[i].iov_len)
+                    std::memcpy(static_cast<char*>(runtime_->stripe_buffer) + copied,
+                                r.iov[i].iov_base, r.iov[i].iov_len);
+                copied += r.iov[i].iov_len;
+            }
         }
     }
-    // One full-range SDK operation, not sixteen independent 1 MiB operations.
-    // There is no padding: every byte came from the caller's adjacent requests.
-    int index = cogni_sdk_prep_io(&runtime_->write, &file->second.sdk,
-                                  &runtime_->stripe_iov, offset, 0, total, nullptr);
+    // One range operation. Writes use only exact caller bytes, without padding.
+    // Contiguous reads use one SDK request even across adjacent KV boundaries.
+    auto* ring = read ? &runtime_->read : &runtime_->write;
+    int index = cogni_sdk_prep_io(ring, &file->second.sdk,
+                                 &runtime_->stripe_iov, offset, 0, total, nullptr);
     if (index < 0) return fail(index);
-    rc = cogni_sdk_submit_ios(&runtime_->write);
+    rc = cogni_sdk_submit_ios(ring);
     if (rc) {
         runtime_->poisoned = true;
         return fail(rc);
     }
     cogni_sdk_cqe cqe{};
-    rc = cogni_sdk_wait_for_ios(&runtime_->write, &cqe, 1, 1, nullptr);
+    rc = cogni_sdk_wait_for_ios(ring, &cqe, 1, 1, nullptr);
     if (rc != 1 || cqe.index != index || cqe.result > int64_t(total)) {
         runtime_->poisoned = true;
         return fail(-EIO);
     }
     if (cqe.result < 0) return fail(cqe.result);
+    if (read) {
+        size_t copied = 0;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto bytes = std::min(*results[i], size_t(cqe.result) - copied);
+            size_t remaining = bytes;
+            for (int j = 0; j < requests[i].iovcnt && remaining; ++j) {
+                const auto& v = requests[i].iov[j];
+                const auto n = std::min(v.iov_len, remaining);
+                if (n)
+                    std::memcpy(v.iov_base,
+                                static_cast<char*>(runtime_->stripe_buffer) +
+                                    copied,
+                                n);
+                copied += n;
+                remaining -= n;
+            }
+            // EOF affects each KV independently; leave bytes past EOF untouched.
+            results[i] = bytes;
+        }
+        VLOG(1) << "CogniStore coalesced read bytes=" << cqe.result
+                << " requests=" << requests.size() << " offset=" << offset;
+        return results;
+    }
     if (size_t(cqe.result) != total) return fail(-EIO);
     rc = cogni_sdk_file_fsync(&file->second.sdk);
     if (rc) return fail(rc);
@@ -501,11 +532,14 @@ CogniStoreFsAdapter::FullStripeWrite(std::span<const FdIoRequest> requests) {
 
 std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchWriteAt(
     std::span<const FdIoRequest> requests) {
-    if (auto striped = FullStripeWrite(requests)) return std::move(*striped);
+    if (auto combined = CoalescedTransfer(requests, false))
+        return std::move(*combined);
     return BatchTransfer(requests, false);
 }
 std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchReadAt(
     std::span<const FdIoRequest> requests) {
+    if (auto combined = CoalescedTransfer(requests, true))
+        return std::move(*combined);
     return BatchTransfer(requests, true);
 }
 std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(

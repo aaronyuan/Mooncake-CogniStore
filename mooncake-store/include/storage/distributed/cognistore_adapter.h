@@ -46,8 +46,8 @@ class CogniStoreFsAdapter final : public FileSystemAdapter {
    private:
     std::vector<tl::expected<size_t, ErrorCode>> BatchTransfer(
         std::span<const FdIoRequest>, bool read);
-    std::optional<std::vector<tl::expected<size_t, ErrorCode>>> FullStripeWrite(
-        std::span<const FdIoRequest>);
+    std::optional<std::vector<tl::expected<size_t, ErrorCode>>> CoalescedTransfer(
+        std::span<const FdIoRequest>, bool read);
     struct File {
         cogni_sdk_file sdk{};
         size_t stripe_bytes{0};

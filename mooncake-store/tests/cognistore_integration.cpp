@@ -268,8 +268,19 @@ void FullStripeTest(const std::string& root) {
     std::string expected(capacity, '\0');
     auto verify = [&] {
         std::string output(capacity, char(0xcd));
-        iovec data{output.data(), output.size()};
-        Check(Take(adapter.ReadAt(ro, &data, 1, 0), "stripe read") == capacity &&
+        std::array<std::array<iovec, 2>, count> buffers;
+        std::array<FdIoRequest, count> requests;
+        for (size_t i = 0; i < count; ++i) {
+            buffers[i] = {{{output.data() + i * size, 113},
+                           {output.data() + i * size + 113, size - 113}}};
+            requests[i] = {ro, buffers[i].data(), 2, int64_t(i * size)};
+        }
+        auto read = adapter.BatchReadAt(requests);
+        Check(read.size() == count, "stripe read count");
+        for (auto& result : read)
+            Check(Take(result, "stripe read") == size, "stripe short read");
+        iovec tail{output.data() + count * size, 17};
+        Check(Take(adapter.ReadAt(ro, &tail, 1, count * size), "stripe tail") == 17 &&
                   output == expected,
               "stripe data or untouched bytes mismatch");
     };
@@ -321,6 +332,27 @@ void FullStripeTest(const std::string& root) {
     Take(adapter.CloseFile(ro), "stripe close held reader");
     ro = Take(adapter.OpenExistingFileForRead(path), "stripe fresh reader");
     verify();
+    std::array<std::string, 2> eof_data{std::string(size, char(0xcd)),
+                                        std::string(size, char(0xcd))};
+    std::array<iovec, 2> eof_buffers{{{eof_data[0].data(), size},
+                                      {eof_data[1].data(), size}}};
+    std::array<FdIoRequest, 2> eof_requests{{
+        {ro, &eof_buffers[0], 1, int64_t(capacity - size - 7)},
+        {ro, &eof_buffers[1], 1, int64_t(capacity - 7)}}};
+    auto eof = adapter.BatchReadAt(eof_requests);
+    Check(eof.size() == 2 && Take(eof[0], "EOF first KV") == size &&
+              Take(eof[1], "EOF second KV") == 7 &&
+              eof_data[0] == expected.substr(capacity - size - 7, size) &&
+              eof_data[1].substr(0, 7) == expected.substr(capacity - 7) &&
+              eof_data[1].substr(7) == std::string(size - 7, char(0xcd)),
+          "coalesced EOF overwrote bytes or lost per-KV lengths");
+    eof_requests[0].offset = capacity;
+    eof_requests[1].offset = capacity + size;
+    const auto before = eof_data;
+    eof = adapter.BatchReadAt(eof_requests);
+    Check(eof.size() == 2 && Take(eof[0], "EOF empty first") == 0 &&
+              Take(eof[1], "EOF empty second") == 0 && eof_data == before,
+          "coalesced empty EOF changed buffers");
     Take(adapter.CloseFile(ro), "stripe close reader");
     Take(adapter.DeleteFile(path), "stripe cleanup");
     std::cout << "COGNISTORE_FULL_STRIPE_PASS stripe_bytes=16777216 objects=16"
