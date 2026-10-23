@@ -28,13 +28,17 @@ metadata in this first implementation. A DFS descriptor records the bucket
 path and ID, value offset, object size, and aligned allocation size. The data
 plane opens an existing bucket for each request and uses synchronous buffered
 positional I/O. A successful request means that the requested `WriteAt` calls
-completed; it is not an `fsync` durability guarantee.
+completed; it is not an `fsync` durability guarantee for the generic adapter.
+The CogniStore path described below additionally calls SDK `fsync` before
+reporting a successful write.
 
 Allocations append in request order. A rollback or removal changes the
 in-memory entry to a tombstone but never rewinds the append cursor and never
 reuses that range. This rule also applies when the same key is allocated again.
 Batch allocation is atomic at allocator level: if any request fails, all ranges
 reserved by that batch become tombstones and no descriptor is returned.
+The public `BatchPutStart` RPC still returns per-key results: its individual
+`PutStart` calls do not form an atomic allocator batch.
 
 ## Lifecycle and eviction
 
@@ -63,7 +67,7 @@ are consumed only by the master allocator.
 | `MOONCAKE_DFS_BUCKET_CAPACITY` | `1073741824` (1 GiB) | Logical and preallocated size of every bucket; must be nonzero, aligned, fit in a signed 64-bit file offset, and match on the master and every DFS client. |
 | `MOONCAKE_DFS_MAX_BUCKET_COUNT` | `64` | Maximum number of live bucket files; must be positive. Buckets awaiting a successful deletion still count. |
 | `MOONCAKE_DFS_ROOT_DIR` | `/mnt/3fs/mooncake` | Absolute shared directory containing the bucket files. |
-| `MOONCAKE_DFS_FS_ADAPTER` | `hf3fs` | Filesystem adapter (`hf3fs` or `posix`). This version uses its buffered synchronous interface. |
+| `MOONCAKE_DFS_FS_ADAPTER` | `hf3fs` | Filesystem adapter (`hf3fs`, `posix`, or `cognistore`). The CogniStore adapter uses the native SDK. |
 | `MOONCAKE_DFS_ALIGNMENT` | `4096` | Power-of-two entry alignment; must divide the bucket capacity. |
 | `MOONCAKE_DFS_EVICTION_ENABLED` | `true` | Enable bucket-level eviction. |
 | `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK` | `0.9` | Usage ratio that starts normal eviction. |
@@ -86,6 +90,36 @@ export MOONCAKE_DFS_ALIGNMENT=4096
 expansion apply only to the `shard` allocator. Conversely, the two bucket
 capacity variables have no effect while `MOONCAKE_DFS_ALLOCATOR=shard`.
 
+## CogniStore batch I/O
+
+With `MOONCAKE_DFS_FS_ADAPTER=cognistore`, the backend opens one handle per
+bucket within a batch, uses `O_RDONLY` for Get and `O_RDWR` for Put, then
+closes those handles before returning. Handles are not retained across batches.
+The backend resolves the canonical root at initialization, while continuing to
+validate each opened bucket's canonical path, identity, and capacity. Changing
+the root symlink while a backend is alive is unsupported and fails validation.
+
+The adapter can combine a batch into one native SDK range when requests name
+the same file and their offsets are consecutive, with at most 16 MiB in total.
+Writes additionally require stripe-aligned offsets and an integral number of
+EC data stripes, using the file's actual layout. No padding or waiting for a
+future batch is introduced. Reads larger than 1 MiB can be coalesced without
+stripe alignment; the returned byte count is scattered to each request, and
+bytes past EOF remain untouched. Other requests fall back to batches of up to
+eight 1 MiB SDK operations. Successful writes retain their SDK `fsync` boundary.
+Bucket preallocation also uses complete stripes where the layout permits.
+
+For the bucket allocator, the RPC wrapper serializes DFS `PutStart` and
+`BatchPutStart` allocation calls against each other. This prevents unrelated
+concurrent Put batches from interleaving their offsets and defeating
+coalescing. Memory-only Put requests do not acquire this gate. Other allocation
+paths, bucket boundaries, failed entries, and nonconsecutive requests can still
+prevent coalescing; the adapter always checks the actual ranges.
+
+For example, 16 adjacent 1 MiB objects form one 16 MiB SDK write with an
+8+2 EC layout using 2 MiB chunks. A batch containing only four such objects
+uses the partial-write fallback. Batch size alone is not a full-stripe promise.
+
 ## Current limitations
 
 This initial backend intentionally provides only the minimal runtime path:
@@ -96,8 +130,9 @@ This initial backend intentionally provides only the minimal runtime path:
 - Snapshot restore, OpLog recovery, standby promotion, and HA continuity do not
   reconstruct bucket state. Do not select `bucket` when those guarantees are
   required.
-- I/O is synchronous and buffered. There is no asynchronous DFS pipeline,
-  Direct I/O (`O_DIRECT`), read coalescing, prefetch, or bucket read cache.
+- The public DFS operation remains synchronous. There is no asynchronous DFS
+  pipeline, generic Direct I/O (`O_DIRECT`), prefetch, or bucket read cache.
+  CogniStore supports only the bounded read coalescing described above.
 - There is no public administrator API for changing the maximum bucket count
   while the service is running.
 - The backend remains single-tenant and experimental. Only one active master
