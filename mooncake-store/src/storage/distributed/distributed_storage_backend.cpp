@@ -197,6 +197,11 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) return init_result;
+    if (UsesBucketAllocator()) {
+        auto root = fs_adapter_->CanonicalPath(root_dir_);
+        if (!root) return tl::make_unexpected(root.error());
+        canonical_bucket_root_ = std::move(*root);
+    }
 
     // Only descriptors returned by the master identify published shards.
     // Opening files from the configured count or a directory scan can retain
@@ -336,12 +341,10 @@ tl::expected<int, ErrorCode> DistributedStorageBackend::OpenBucket(
     if (*file_size != distributed_config_.bucket_capacity) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const auto canonical_root = fs_adapter_->CanonicalPath(root.string());
-    if (!canonical_root) return tl::make_unexpected(canonical_root.error());
     const auto canonical_path = fs_adapter_->CanonicalPath(path.string());
     if (!canonical_path) return tl::make_unexpected(canonical_path.error());
     const std::filesystem::path resolved(*canonical_path);
-    if (resolved.parent_path() != std::filesystem::path(*canonical_root) ||
+    if (resolved.parent_path() != std::filesystem::path(canonical_bucket_root_) ||
         resolved.filename() != path.filename()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }

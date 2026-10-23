@@ -420,6 +420,47 @@ TEST(ImmutableBucketBackendTest, RejectsEscapesMismatchAndMissingFile) {
     EXPECT_FALSE(std::filesystem::exists(descriptor->file_path));
 }
 
+TEST(ImmutableBucketBackendTest, PinsRootButStillRejectsBucketSymlinkEscape) {
+    TempDir parent, original, replacement;
+    const auto alias = std::filesystem::path(parent.string()) / "root";
+    std::filesystem::create_directory_symlink(original.string(), alias);
+    auto config = MakeConfig(original);
+    config.fsdir = alias.string();
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    auto descriptor = allocator.Allocate("key", 4);
+    ASSERT_TRUE(descriptor);
+    FileStorageConfig file_config;
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>());
+    ASSERT_TRUE(backend.Init());
+    std::string value = "data", output(4, '\0');
+    ASSERT_TRUE(backend.BatchWrite({{"key", *descriptor, {{value.data(), 4}}}})[0]);
+    const auto name = std::filesystem::path(descriptor->file_path).filename();
+    const auto outside = std::filesystem::path(replacement.string()) / name;
+    std::filesystem::copy_file(descriptor->file_path, outside);
+
+    // Changing the root alias cannot redirect this backend into another store.
+    std::filesystem::remove(alias);
+    std::filesystem::create_directory_symlink(replacement.string(), alias);
+    auto reads = backend.BatchRead({{"key", *descriptor, {{output.data(), 4}}}});
+    ASSERT_FALSE(reads[0]);
+    EXPECT_EQ(reads[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(output, std::string(4, '\0'));
+
+    // Restoring the root works; individual files are still resolved per open.
+    std::filesystem::remove(alias);
+    std::filesystem::create_directory_symlink(original.string(), alias);
+    reads = backend.BatchRead({{"key", *descriptor, {{output.data(), 4}}}});
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+    std::filesystem::remove(descriptor->file_path);
+    std::filesystem::create_symlink(outside, descriptor->file_path);
+    auto writes = backend.BatchWrite({{"key", *descriptor, {{value.data(), 4}}}});
+    ASSERT_FALSE(writes[0]);
+    EXPECT_EQ(writes[0].error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST(ImmutableBucketBackendTest, ZeroProgressIsReportedAsWriteFailure) {
     TempDir dir;
     const auto config = MakeConfig(dir);

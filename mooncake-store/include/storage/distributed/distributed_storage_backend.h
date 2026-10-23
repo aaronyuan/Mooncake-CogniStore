@@ -141,6 +141,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
+    // The bucket namespace is fixed for this backend lifetime.
+    std::string canonical_bucket_root_;
     // Create shard entries only from descriptors published by the master.
     // The cache lock protects lookup/insertion; each shard's mutex protects
     // initialization (fd stays -1 until opening succeeds) and, for adapters
