@@ -1430,6 +1430,10 @@ class BenchmarkRunner:
             return phases
 
         if self.args.scenario == "write_perf":
+            # Let independent writers finish client setup before a shared barrier.
+            if self.args.phase_gap_mode != "none":
+                self._make_sessions()
+                self._phase_gap("main_run")
             total_objects = self._write_budget()
             if self.args.runtime > 0:
                 phases.append(self._run_time_based_write("write_perf", total_objects))

@@ -165,6 +165,51 @@ class ExistingDatasetReadTest(unittest.TestCase):
         store.close.assert_called_once()
 
 
+class WriterBarrierTest(unittest.TestCase):
+    def test_barrier_follows_setup_and_precedes_put(self):
+        for runtime in (0, 1):
+            with self.subTest(runtime=runtime):
+                args = bench.build_parser().parse_args(
+                    [
+                        "--scenario",
+                        "write_perf",
+                        "--runtime",
+                        str(runtime),
+                        "--nr-objects",
+                        "3",
+                        "--value-size",
+                        "512",
+                        "--phase-gap-mode",
+                        "file",
+                        "--phase-gap-file",
+                        "/unused",
+                    ]
+                )
+                store = Mock()
+                store.setup.return_value = 0
+                store.put.return_value = 0
+                with patch.object(
+                    bench, "MooncakeDistributedStore", return_value=store
+                ):
+                    runner = bench.BenchmarkRunner(args)
+
+                    def ready(label):
+                        self.assertEqual(label, "main_run")
+                        store.setup.assert_called_once()
+                        store.put.assert_not_called()
+
+                    try:
+                        with patch.object(
+                            runner, "_phase_gap", side_effect=ready
+                        ) as gap:
+                            phases = runner.run()
+                        gap.assert_called_once_with("main_run")
+                        self.assertEqual(phases[0].successful_kvs, 3)
+                    finally:
+                        runner.close()
+                store.close.assert_called_once()
+
+
 class OutputTest(unittest.TestCase):
     def test_journal_replay_summary_and_sampling(self):
         root = Path(f"/tmp/mooncake-kv-bench-test-{os.getpid()}")

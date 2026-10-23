@@ -299,3 +299,12 @@ If a worker raises an exception, the benchmark waits for all workers to finish,
 reports the failed phase and lane, and exits with code `1`. This error path does
 not write a new summary or journal; any output files from an earlier run remain
 unchanged.
+
+### Coordinating independent writers
+
+`write_perf` honors `--phase-gap-mode` after client initialization and before
+its write phase. Separate invocations can use the same `--phase-gap-file` to
+start together after setup. Give each writer a disjoint `--object-id-start` /
+`--write-objects` range, a distinct endpoint, and separate output paths.
+`--numjobs` in this native tool still controls threads; an external launcher
+can translate its own process-count option into separate benchmark invocations.
