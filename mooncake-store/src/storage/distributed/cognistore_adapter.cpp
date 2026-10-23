@@ -15,6 +15,7 @@ namespace mooncake {
 namespace {
 constexpr size_t kBufferSize = 1024 * 1024;
 constexpr size_t kBatchEntries = 8;
+constexpr size_t kMaxStripeBytes = 16 * 1024 * 1024;
 ErrorCode Translate(int64_t rc, ErrorCode fallback) {
     if (rc == -ENOENT) return ErrorCode::FILE_NOT_FOUND;
     if (rc == -EINVAL) return ErrorCode::INVALID_PARAMS;
@@ -55,9 +56,11 @@ struct CogniStoreFsAdapter::Runtime {
     std::string config;
     pid_t pid{::getpid()};
     cogni_sdk sdk{};
-    cogni_sdk_iov iov{};
+    cogni_sdk_iov iov{}, stripe_iov{};
     cogni_sdk_ior read{}, write{}, batch_read{}, batch_write{};
     void* buffer{nullptr};
+    void* stripe_buffer{nullptr};
+    int numa{-1};
     bool poisoned{false};
 
     int Start(const std::string& path) {
@@ -69,7 +72,6 @@ struct CogniStoreFsAdapter::Runtime {
             return -ENOMEM;
         // Native registration verifies the NUMA home of resident payload pages.
         std::memset(buffer, 0, kBufferSize * kBatchEntries);
-        int numa = -1;
         if (const char* setting =
                 std::getenv("MOONCAKE_COGNISTORE_NUMA_NODE")) {
             char* end = nullptr;
@@ -93,6 +95,16 @@ struct CogniStoreFsAdapter::Runtime {
         return cogni_sdk_ior_create(&sdk, &batch_write, kBatchEntries, 0,
                                     -int(kBatchEntries), 1, 1, 0);
     }
+    int EnsureStripeBuffer() {
+        if (stripe_iov.private_data) return 0;
+        // A failed registration can retain an unknown SDK owner. Keep that
+        // allocation until shutdown and never reuse it for another attempt.
+        if (stripe_buffer) return -EIO;
+        if (posix_memalign(&stripe_buffer, 4096, kMaxStripeBytes)) return -ENOMEM;
+        std::memset(stripe_buffer, 0, kMaxStripeBytes);
+        return cogni_sdk_iov_register(&sdk, &stripe_iov, stripe_buffer,
+                                      kMaxStripeBytes, kMaxStripeBytes, numa);
+    }
     ~Runtime() {
         // Fail closed rather than freeing buffers still owned by an unknown
         // I/O.
@@ -100,9 +112,11 @@ struct CogniStoreFsAdapter::Runtime {
         if (batch_write.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&batch_write), 0);
         if (read.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&read), 0);
         if (write.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&write), 0);
+        if (stripe_iov.private_data) CHECK_EQ(cogni_sdk_iov_release(&stripe_iov), 0);
         if (iov.private_data) CHECK_EQ(cogni_sdk_iov_release(&iov), 0);
         if (sdk.private_data) CHECK_EQ(cogni_sdk_shutdown(&sdk), 0);
         std::free(buffer);
+        std::free(stripe_buffer);
     }
 };
 
@@ -175,7 +189,7 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::Shutdown() {
     {
         std::lock_guard lock(runtime_->mutex);
         for (auto it = files_.begin(); it != files_.end();) {
-            int rc = cogni_sdk_file_close(&it->second);
+            int rc = cogni_sdk_file_close(&it->second.sdk);
             if (rc)
                 return tl::make_unexpected(
                     Translate(rc, ErrorCode::FILE_INVALID_HANDLE));
@@ -285,12 +299,30 @@ tl::expected<int, ErrorCode> CogniStoreFsAdapter::Open(const std::string& path,
     if (next_fd_ == INT_MAX)
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     // Allocate the map node before acquiring the SDK resource.
-    auto [it, inserted] = files_.emplace(next_fd_, cogni_sdk_file{});
-    int rc = cogni_sdk_file_open(&runtime_->sdk, &it->second, path.c_str(),
+    auto [it, inserted] = files_.emplace(next_fd_, File{});
+    int rc = cogni_sdk_file_open(&runtime_->sdk, &it->second.sdk, path.c_str(),
                                  flags, 0644);
     if (rc) {
         files_.erase(it);
         return tl::make_unexpected(Translate(rc, ErrorCode::FILE_OPEN_FAIL));
+    }
+    if ((flags & O_ACCMODE) != O_RDONLY) {
+        // Geometry is an optimization hint. Actual I/O still goes through the
+        // opened SDK File, which resolves and validates its current layout.
+        auto stat = Request<cogni_sdk_stat_req_v1>();
+        stat.path = Path(path);
+        ResultOwner metadata;
+        cogni_sdk_status_v1 status{};
+        cogni_sdk_inode_view_v1 view{};
+        view.struct_size = sizeof(view);
+        if (!cogni_sdk_stat_v1(&runtime_->sdk, &stat, &metadata.value, &status) &&
+            !cogni_sdk_result_inode_v1(&metadata.value, &view, &status)) {
+            const auto& layout = view.inode.layout;
+            const uint64_t bytes =
+                uint64_t(layout.chunk_size) * layout.data_fragments;
+            if (layout.parity_fragments && bytes && bytes <= kMaxStripeBytes)
+                it->second.stripe_bytes = size_t(bytes);
+        }
     }
     return next_fd_++;
 }
@@ -312,7 +344,7 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::CloseFile(int fd) {
     auto it = files_.find(fd);
     if (it == files_.end())
         return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    int rc = cogni_sdk_file_close(&it->second);
+    int rc = cogni_sdk_file_close(&it->second.sdk);
     if (rc)
         return tl::make_unexpected(
             Translate(rc, ErrorCode::FILE_INVALID_HANDLE));
@@ -347,7 +379,7 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::Transfer(
             size_t n = std::min(kBufferSize, vectors[i].iov_len - part);
             auto* user = static_cast<char*>(vectors[i].iov_base) + part;
             if (!read) std::memcpy(runtime_->buffer, user, n);
-            int index = cogni_sdk_prep_io(ring, &it->second, &runtime_->iov,
+            int index = cogni_sdk_prep_io(ring, &it->second.sdk, &runtime_->iov,
                                           offset + done, 0, n, nullptr);
             if (index < 0)
                 return tl::make_unexpected(Translate(index, failure));
@@ -380,7 +412,7 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::Transfer(
         }
     }
     if (!read && done) {
-        int rc = cogni_sdk_file_fsync(&it->second);
+        int rc = cogni_sdk_file_fsync(&it->second.sdk);
         if (rc) return tl::make_unexpected(Translate(rc, failure));
     }
     return done;
@@ -395,8 +427,81 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::ReadAt(int fd, iovec* v,
     return Transfer(fd, v, n, o, true);
 }
 
+std::optional<std::vector<tl::expected<size_t, ErrorCode>>>
+CogniStoreFsAdapter::FullStripeWrite(std::span<const FdIoRequest> requests) {
+    if (requests.empty() || !runtime_) return std::nullopt;
+    std::lock_guard lock(runtime_->mutex);
+    auto file = files_.find(requests.front().fd);
+    if (file == files_.end() || !file->second.stripe_bytes) return std::nullopt;
+    const auto offset = requests.front().offset;
+    if (offset < 0 || uint64_t(offset) % file->second.stripe_bytes)
+        return std::nullopt;
+    std::vector<tl::expected<size_t, ErrorCode>> results;
+    results.reserve(requests.size());
+    size_t total = 0;
+    for (const auto& r : requests) {
+        if (r.fd != requests.front().fd || r.offset < 0 ||
+            uint64_t(r.offset) != uint64_t(offset) + total || r.iovcnt <= 0 ||
+            !r.iov)
+            return std::nullopt;
+        size_t length = 0;
+        for (int i = 0; i < r.iovcnt; ++i) {
+            if ((r.iov[i].iov_len && !r.iov[i].iov_base) ||
+                r.iov[i].iov_len > kMaxStripeBytes - total)
+                return std::nullopt;
+            length += r.iov[i].iov_len;
+            total += r.iov[i].iov_len;
+        }
+        if (!length) return std::nullopt;
+        results.emplace_back(length);
+    }
+    if (total % file->second.stripe_bytes || total > size_t(INT64_MAX - offset))
+        return std::nullopt;
+    auto fail = [&](int64_t rc) {
+        for (auto& result : results)
+            result = tl::make_unexpected(Translate(rc, ErrorCode::FILE_WRITE_FAIL));
+        return results;
+    };
+    if (runtime_->poisoned) return fail(-EIO);
+    int rc = runtime_->EnsureStripeBuffer();
+    if (rc) return fail(rc);
+    size_t copied = 0;
+    for (const auto& r : requests) {
+        for (int i = 0; i < r.iovcnt; ++i) {
+            if (r.iov[i].iov_len)
+                std::memcpy(static_cast<char*>(runtime_->stripe_buffer) + copied,
+                            r.iov[i].iov_base, r.iov[i].iov_len);
+            copied += r.iov[i].iov_len;
+        }
+    }
+    // One full-range SDK operation, not sixteen independent 1 MiB operations.
+    // There is no padding: every byte came from the caller's adjacent requests.
+    int index = cogni_sdk_prep_io(&runtime_->write, &file->second.sdk,
+                                  &runtime_->stripe_iov, offset, 0, total, nullptr);
+    if (index < 0) return fail(index);
+    rc = cogni_sdk_submit_ios(&runtime_->write);
+    if (rc) {
+        runtime_->poisoned = true;
+        return fail(rc);
+    }
+    cogni_sdk_cqe cqe{};
+    rc = cogni_sdk_wait_for_ios(&runtime_->write, &cqe, 1, 1, nullptr);
+    if (rc != 1 || cqe.index != index || cqe.result > int64_t(total)) {
+        runtime_->poisoned = true;
+        return fail(-EIO);
+    }
+    if (cqe.result < 0) return fail(cqe.result);
+    if (size_t(cqe.result) != total) return fail(-EIO);
+    rc = cogni_sdk_file_fsync(&file->second.sdk);
+    if (rc) return fail(rc);
+    VLOG(1) << "CogniStore full-stripe write bytes=" << total
+            << " requests=" << requests.size() << " offset=" << offset;
+    return results;
+}
+
 std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchWriteAt(
     std::span<const FdIoRequest> requests) {
+    if (auto striped = FullStripeWrite(requests)) return std::move(*striped);
     return BatchTransfer(requests, false);
 }
 std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchReadAt(
@@ -460,7 +565,7 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
                     offset += r.iov[j].iov_len;
                 }
             }
-            int index = cogni_sdk_prep_io(ring, &file->second, &runtime_->iov,
+            int index = cogni_sdk_prep_io(ring, &file->second.sdk, &runtime_->iov,
                                          r.offset, i * kBufferSize, lengths[i], nullptr);
             if (index < 0) {
                 results[start + i] = tl::make_unexpected(Translate(index, failure));
@@ -517,7 +622,7 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
                     if (wave[j].fd == r.fd && results[start + j]) synced = true;
                 }
                 if (synced) continue;
-                int rc = cogni_sdk_file_fsync(&files_.at(r.fd));
+                int rc = cogni_sdk_file_fsync(&files_.at(r.fd).sdk);
                 if (rc) {
                     for (size_t j = i; j < wave.size(); ++j) {
                         if (wave[j].fd == r.fd && results[start + j])
@@ -538,16 +643,29 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::PreallocateFile(
     if (!opened) return tl::make_unexpected(opened.error());
     std::vector<char> zeros(std::min<uint64_t>(size, kBufferSize), 0);
     tl::expected<void, ErrorCode> result;
+    constexpr size_t entries = kMaxStripeBytes / kBufferSize;
     for (uint64_t offset = 0; offset < size;) {
-        iovec v{zeros.data(), static_cast<size_t>(std::min<uint64_t>(
-                                  zeros.size(), size - offset))};
-        auto written = WriteAt(*opened, &v, 1, static_cast<int64_t>(offset));
-        if (!written || *written != v.iov_len) {
-            result = tl::make_unexpected(written ? ErrorCode::FILE_WRITE_FAIL
-                                                 : written.error());
-            break;
+        std::array<iovec, entries> buffers{};
+        std::vector<FdIoRequest> requests;
+        requests.reserve(entries);
+        for (size_t i = 0; i < entries && offset < size; ++i) {
+            buffers[i] = {zeros.data(), static_cast<size_t>(std::min<uint64_t>(
+                                           zeros.size(), size - offset))};
+            requests.push_back(
+                {*opened, &buffers[i], 1, static_cast<int64_t>(offset)});
+            offset += buffers[i].iov_len;
         }
-        offset += *written;
+        // BatchWriteAt drains and fsyncs this file before returning. Keep the
+        // bucket private until every zero-filled range and close completes.
+        auto written = BatchWriteAt(requests);
+        for (size_t i = 0; i < written.size(); ++i) {
+            if (!written[i] || *written[i] != buffers[i].iov_len) {
+                result = tl::make_unexpected(written[i] ? ErrorCode::FILE_WRITE_FAIL
+                                                        : written[i].error());
+                break;
+            }
+        }
+        if (!result) break;
     }
     auto closed = CloseFile(*opened);
     if (!result) return result;

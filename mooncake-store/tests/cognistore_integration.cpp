@@ -60,6 +60,15 @@ void AdapterTest(const std::string& root) {
           "preallocate overwrote existing file");
     CogniStoreFsAdapter file_root;
     Check(!file_root.Init(path), "ordinary file accepted as adapter root");
+    // Verify the whole zero-filled capacity, including a partial final slot,
+    // before any KV overwrites it. Preallocation must preserve exact length.
+    int zero_fd = Take(first.OpenExistingFileForRead(path), "preallocation reader");
+    std::string zero_bytes(capacity, char(0xcd));
+    iovec zero_read{zero_bytes.data(), zero_bytes.size()};
+    Check(Take(first.ReadAt(zero_fd, &zero_read, 1, 0), "preallocation read") == capacity &&
+              std::all_of(zero_bytes.begin(), zero_bytes.end(), [](char c) { return c == 0; }),
+          "preallocation bytes mismatch");
+    Take(first.CloseFile(zero_fd), "close preallocation reader");
     int fd = Take(first.OpenExistingFile(path), "open");
     auto expected = Pattern(1024 * 1024 + 113, 5);
     iovec parts[]{{expected.data(), 79},
@@ -243,6 +252,79 @@ void BatchIoTest(const std::string& root) {
     Take(adapter.CloseFile(ro), "batch close reader");
     Take(adapter.DeleteFile(path), "batch cleanup");
     std::cout << "COGNISTORE_BATCH_IO_PASS objects=11 scatter=2 partial_prep=1 short_eof=1 overlap=1" << std::endl;
+}
+// A 16 MiB stripe is split across sixteen KV requests. Preserve untouched
+// bytes when a short, gapped or unaligned batch cannot take the full-stripe path.
+void FullStripeTest(const std::string& root) {
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "stripe init");
+    constexpr size_t size = 1024 * 1024, count = 16, capacity = count * size + 17;
+    const auto path = root + "/value";
+    Take(adapter.PreallocateFile(path, capacity), "stripe preallocate");
+    Check(Take(adapter.GetFileSize(path), "stripe size") == capacity,
+          "stripe capacity mismatch");
+    int fd = Take(adapter.OpenExistingFile(path), "stripe writer");
+    int ro = Take(adapter.OpenExistingFileForRead(path), "stripe reader");
+    std::string expected(capacity, '\0');
+    auto verify = [&] {
+        std::string output(capacity, char(0xcd));
+        iovec data{output.data(), output.size()};
+        Check(Take(adapter.ReadAt(ro, &data, 1, 0), "stripe read") == capacity &&
+                  output == expected,
+              "stripe data or untouched bytes mismatch");
+    };
+    verify();
+    std::array<std::string, count> values;
+    std::array<std::array<iovec, 2>, count> buffers;
+    std::array<FdIoRequest, count> requests;
+    auto prepare = [&](size_t seed, int64_t offset) {
+        for (size_t i = 0; i < count; ++i) {
+            values[i] = Pattern(size, seed + i);
+            buffers[i] = {{{values[i].data(), 113},
+                           {values[i].data() + 113, size - 113}}};
+            requests[i] = {fd, buffers[i].data(), 2, offset + int64_t(i * size)};
+        }
+    };
+    auto write = [&](std::span<const FdIoRequest> batch) {
+        auto results = adapter.BatchWriteAt(batch);
+        Check(results.size() == batch.size(), "stripe result count");
+        for (size_t i = 0; i < batch.size(); ++i) {
+            Check(Take(results[i], "stripe write") == size, "short stripe write");
+            size_t offset = batch[i].offset;
+            for (int j = 0; j < batch[i].iovcnt; ++j) {
+                const auto& part = batch[i].iov[j];
+                expected.replace(offset, part.iov_len,
+                                 static_cast<const char*>(part.iov_base), part.iov_len);
+                offset += part.iov_len;
+            }
+        }
+        verify();
+    };
+    prepare(100, 0);
+    write(requests);
+    prepare(200, 0);
+    write(std::span<const FdIoRequest>(requests).subspan(5, 4));
+    // A held read-only handle must resolve the committed version after close.
+    Take(adapter.CloseFile(fd), "stripe close partial writer");
+    verify();
+    fd = Take(adapter.OpenExistingFile(path), "stripe reopen writer");
+    prepare(300, 0);
+    write(requests);
+    prepare(400, 0);
+    std::vector<FdIoRequest> gapped(requests.begin(), requests.end());
+    gapped.erase(gapped.begin() + 8);
+    write(gapped);
+    prepare(500, 1);
+    write(requests);
+    Take(adapter.CloseFile(fd), "stripe close writer");
+    verify();
+    Take(adapter.CloseFile(ro), "stripe close held reader");
+    ro = Take(adapter.OpenExistingFileForRead(path), "stripe fresh reader");
+    verify();
+    Take(adapter.CloseFile(ro), "stripe close reader");
+    Take(adapter.DeleteFile(path), "stripe cleanup");
+    std::cout << "COGNISTORE_FULL_STRIPE_PASS stripe_bytes=16777216 objects=16"
+                 " full=2 partial=1 gapped=1 unaligned=1 tail=17" << std::endl;
 }
 // Check the overwritten bytes and both retained patterned sides, then repeat
 // through a new read-only handle after writer close/promotion.
@@ -507,13 +589,15 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     try {
         Check(argc >= 3,
-              "usage: cognistore_integration adapter/small-io/batch-io ROOT | put/read ROOT "
+              "usage: cognistore_integration adapter/small-io/batch-io/full-stripe ROOT | put/read ROOT "
               "MASTER | concurrent-writer/concurrent-reader ROOT CONTROL_DIR VALUE_SIZE");
         std::string mode = argv[1], root = argv[2];
         if (mode == "adapter")
             AdapterTest(root);
         else if (mode == "batch-io")
             BatchIoTest(root);
+        else if (mode == "full-stripe")
+            FullStripeTest(root);
         else if (mode == "small-io")
             SmallIoTest(root);
         else if (mode == "concurrent-writer" || mode == "concurrent-reader") {

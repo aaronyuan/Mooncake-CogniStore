@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include "storage/distributed/fs_adapter.h"
 #include <cognistore/sdk/cogni.h>
@@ -8,6 +9,7 @@
 namespace mooncake {
 // Initial synchronous, copy-based bridge to the process-local SDK C ABI.
 // Bucket batching reuses handles and submits bounded SDK I/O batches.
+// Contiguous aligned writes coalesce into full stripes (up to 16 MiB).
 // Stale-fd retries remain disabled.
 class CogniStoreFsAdapter final : public FileSystemAdapter {
    public:
@@ -44,9 +46,15 @@ class CogniStoreFsAdapter final : public FileSystemAdapter {
    private:
     std::vector<tl::expected<size_t, ErrorCode>> BatchTransfer(
         std::span<const FdIoRequest>, bool read);
+    std::optional<std::vector<tl::expected<size_t, ErrorCode>>> FullStripeWrite(
+        std::span<const FdIoRequest>);
+    struct File {
+        cogni_sdk_file sdk{};
+        size_t stripe_bytes{0};
+    };
     struct Runtime;
     std::shared_ptr<Runtime> runtime_;
-    std::unordered_map<int, cogni_sdk_file> files_;
+    std::unordered_map<int, File> files_;
     int next_fd_{1};
     tl::expected<int, ErrorCode> Open(const std::string&, int);
     tl::expected<size_t, ErrorCode> Transfer(int, const iovec*, int, int64_t,
