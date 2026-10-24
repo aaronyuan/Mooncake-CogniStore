@@ -965,7 +965,9 @@ class BenchmarkRunner:
                     label,
                 )
                 return
-            time.sleep(1.0)
+            # Keep independently started clients close to the release instant.
+            # A one-second poll visibly skews short multi-process I/O phases.
+            time.sleep(0.01)
         raise TimeoutError(
             f"timed out waiting for phase gap file {self.args.phase_gap_file}"
         )

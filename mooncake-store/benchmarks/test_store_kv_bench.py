@@ -88,6 +88,45 @@ class StoreModuleCompatibilityTest(unittest.TestCase):
             sys.modules.pop(module_name, None)
 
 
+class FilePhaseGapTest(unittest.TestCase):
+    def test_file_release_is_observed_without_a_second_of_start_skew(self):
+        args = bench.build_parser().parse_args([
+            "--scenario", "read_perf",
+            "--phase-gap-mode", "file", "--phase-gap-file", "/release",
+            "--phase-gap-timeout-sec", "1",
+        ])
+        runner = bench.BenchmarkRunner(args)
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with patch.object(bench.time, "time", side_effect=lambda: clock[0]), patch.object(
+            bench.time, "sleep", side_effect=sleep
+        ), patch.object(bench.os.path, "exists", side_effect=lambda _: clock[0] >= 0.002):
+            runner._phase_gap("test")
+        self.assertLess(clock[0], 0.05)
+
+    def test_missing_release_still_times_out(self):
+        args = bench.build_parser().parse_args([
+            "--scenario", "read_perf",
+            "--phase-gap-mode", "file", "--phase-gap-file", "/release",
+            "--phase-gap-timeout-sec", "1",
+        ])
+        runner = bench.BenchmarkRunner(args)
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with patch.object(bench.time, "time", side_effect=lambda: clock[0]), patch.object(
+            bench.time, "sleep", side_effect=sleep
+        ), patch.object(bench.os.path, "exists", return_value=False):
+            with self.assertRaises(TimeoutError):
+                runner._phase_gap("test")
+        self.assertGreaterEqual(clock[0], 1.0)
+
+
 class MetadataWorkloadModelTest(unittest.TestCase):
     def test_percentages_and_lane_choices_are_deterministic(self):
         weights = {"put": 40, "get": 30, "exist": 20, "remove": 10}
