@@ -358,6 +358,57 @@ void FullStripeTest(const std::string& root) {
     std::cout << "COGNISTORE_FULL_STRIPE_PASS stripe_bytes=16777216 objects=16"
                  " full=2 partial=1 gapped=1 unaligned=1 tail=17" << std::endl;
 }
+// Establish a multi-stripe bucket without requiring physical zero writes for
+// its holes. Check EOF, every hole and out-of-order writes through a fresh fd.
+void SparseBucketTest(const std::string& root) {
+    constexpr size_t stripe = 16 * 1024 * 1024, capacity = 4 * stripe + 17;
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "sparse init");
+    const auto path = root + "/sparse";
+    Take(adapter.PreallocateFile(path, capacity), "sparse preallocate");
+    Check(Take(adapter.GetFileSize(path), "sparse size") == capacity,
+          "sparse capacity mismatch");
+    auto full = Pattern(stripe, 901);
+    auto patch = Pattern(4096, 902);
+    auto verify = [&](bool written) {
+        int fd = Take(adapter.OpenExistingFileForRead(path), "sparse open reader");
+        for (size_t offset = 0; offset < capacity; offset += stripe) {
+            const size_t size = std::min(stripe, capacity - offset);
+            std::string got(size, char(0xcd)), expected(size, '\0');
+            if (written && offset == 0) expected = full;
+            if (written && offset == 2 * stripe)
+                expected.replace(37, patch.size(), patch);
+            iovec dest{got.data(), got.size()};
+            FdIoRequest request{fd, &dest, 1, int64_t(offset)};
+            Check(Take(adapter.BatchReadAt({&request, 1}).front(),
+                       "sparse read") == size && got == expected,
+                  "sparse hole/payload mismatch");
+        }
+        char sentinel = char(0xcd);
+        iovec eof{&sentinel, 1};
+        Check(Take(adapter.ReadAt(fd, &eof, 1, capacity), "sparse EOF") == 0 &&
+                  sentinel == char(0xcd), "sparse EOF changed destination");
+        Take(adapter.CloseFile(fd), "sparse close reader");
+    };
+    verify(false);
+    int fd = Take(adapter.OpenExistingFile(path), "sparse open writer");
+    iovec small{patch.data(), patch.size()}, data{full.data(), full.size()};
+    Check(Take(adapter.WriteAt(fd, &small, 1, 2 * stripe + 37),
+               "sparse partial") == patch.size(),
+          "sparse short partial write");
+    FdIoRequest request{fd, &data, 1, 0};
+    Check(Take(adapter.BatchWriteAt({&request, 1}).front(),
+               "sparse full stripe") == stripe,
+          "sparse short full write");
+    Take(adapter.CloseFile(fd), "sparse close writer");
+    verify(true);
+    Check(Take(adapter.GetFileSize(path), "sparse final size") == capacity,
+          "sparse writes changed capacity");
+    Take(adapter.DeleteFile(path), "sparse cleanup");
+    std::cout << "COGNISTORE_SPARSE_BUCKET_PASS capacity=67108881 holes=4"
+                 " partial=4096 full=16777216" << std::endl;
+}
+
 // Check the overwritten bytes and both retained patterned sides, then repeat
 // through a new read-only handle after writer close/promotion.
 void SmallIoTest(const std::string& root) {
@@ -621,7 +672,7 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     try {
         Check(argc >= 3,
-              "usage: cognistore_integration adapter/small-io/batch-io/full-stripe ROOT | put/read ROOT "
+              "usage: cognistore_integration adapter/small-io/batch-io/full-stripe/sparse-bucket ROOT | put/read ROOT "
               "MASTER | concurrent-writer/concurrent-reader ROOT CONTROL_DIR VALUE_SIZE");
         std::string mode = argv[1], root = argv[2];
         if (mode == "adapter")
@@ -630,6 +681,8 @@ int main(int argc, char** argv) {
             BatchIoTest(root);
         else if (mode == "full-stripe")
             FullStripeTest(root);
+        else if (mode == "sparse-bucket")
+            SparseBucketTest(root);
         else if (mode == "small-io")
             SmallIoTest(root);
         else if (mode == "concurrent-writer" || mode == "concurrent-reader") {

@@ -678,7 +678,16 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::PreallocateFile(
     std::vector<char> zeros(std::min<uint64_t>(size, kBufferSize), 0);
     tl::expected<void, ErrorCode> result;
     constexpr size_t entries = kMaxStripeBytes / kBufferSize;
-    for (uint64_t offset = 0; offset < size;) {
+    // New EC buckets need logical capacity, not a second full copy of zeros.
+    // Materialize the final stripe to establish EOF; earlier holes read as zero.
+    // Keep the existing initialization for layouts without a verified geometry.
+    uint64_t begin = 0;
+    {
+        std::lock_guard lock(runtime_->mutex);
+        const auto stripe = files_.at(*opened).stripe_bytes;
+        if (stripe) begin = ((size - 1) / stripe) * stripe;
+    }
+    for (uint64_t offset = begin; offset < size;) {
         std::array<iovec, entries> buffers{};
         std::vector<FdIoRequest> requests;
         requests.reserve(entries);
@@ -690,7 +699,7 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::PreallocateFile(
             offset += buffers[i].iov_len;
         }
         // BatchWriteAt drains and fsyncs this file before returning. Keep the
-        // bucket private until every zero-filled range and close completes.
+        // bucket private until the tail write and close complete.
         auto written = BatchWriteAt(requests);
         for (size_t i = 0; i < written.size(); ++i) {
             if (!written[i] || *written[i] != buffers[i].iov_len) {

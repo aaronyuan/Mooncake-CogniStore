@@ -107,7 +107,15 @@ future batch is introduced. Reads larger than 1 MiB can be coalesced without
 stripe alignment; the returned byte count is scattered to each request, and
 bytes past EOF remain untouched. Other requests fall back to batches of up to
 eight 1 MiB SDK operations. Successful writes retain their SDK `fsync` boundary.
-Bucket preallocation also uses complete stripes where the layout permits.
+For a new EC bucket with known geometry, initialization writes zeros only to
+its final data stripe (or the used part of that stripe), then completes `fsync`,
+close and the exact file-size check before publishing the bucket. Earlier ranges
+remain sparse holes and read as zeros. A 256 MiB bucket with 16 MiB data stripes
+therefore writes 16 MiB during initialization instead of 256 MiB. This establishes
+logical capacity; it does not reserve physical storage for future KV writes.
+Those writes still propagate allocation failures and must complete before their
+KV descriptors become readable. Layouts without a verified EC geometry retain
+the full zero-initialization path. No truncate or punch-hole operation is used.
 
 For the bucket allocator, the RPC wrapper serializes DFS `PutStart` and
 `BatchPutStart` allocation calls against each other. This prevents unrelated
