@@ -335,21 +335,9 @@ tl::expected<int, ErrorCode> DistributedStorageBackend::OpenBucket(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const std::string file_path = path.string();
-    auto file_size = fs_adapter_->GetFileSize(file_path);
-    if (!file_size) return tl::make_unexpected(file_size.error());
-    if (*file_size != distributed_config_.bucket_capacity) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const auto canonical_path = fs_adapter_->CanonicalPath(path.string());
-    if (!canonical_path) return tl::make_unexpected(canonical_path.error());
-    const std::filesystem::path resolved(*canonical_path);
-    if (resolved.parent_path() != std::filesystem::path(canonical_bucket_root_) ||
-        resolved.filename() != path.filename()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    return write ? fs_adapter_->OpenExistingFile(file_path)
-                 : fs_adapter_->OpenExistingFileForRead(file_path);
+    return fs_adapter_->OpenValidatedFile(path.string(),
+                                          distributed_config_.bucket_capacity,
+                                          canonical_bucket_root_, write);
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(

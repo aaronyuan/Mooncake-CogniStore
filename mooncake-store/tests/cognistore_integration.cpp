@@ -38,6 +38,56 @@ std::string Pattern(size_t size, size_t seed) {
             static_cast<char>((i * 131 + i / 257 + (seed + 1) * 17) % 251);
     return value;
 }
+void ValidatedOpenTest(const std::string& root) {
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "validated init");
+    const auto canonical = Take(adapter.CanonicalPath(root), "canonical root");
+    const auto path = root + "/value";
+    constexpr size_t capacity = 1024 * 1024;
+    Check(!adapter.OpenValidatedFile(path, capacity, canonical, false),
+          "missing validated open succeeded");
+    Check(!Take(adapter.FileExists(path), "missing exists"),
+          "missing file created");
+    Take(adapter.PreallocateFile(path, capacity), "preallocate");
+    Check(!adapter.OpenValidatedFile(path, capacity + 1, canonical, false),
+          "wrong capacity accepted");
+    Check(
+        !adapter.OpenValidatedFile(path, capacity, canonical + "/other", false),
+        "canonical root escape accepted");
+    Check(!adapter.OpenValidatedFile(root, 0, canonical, false),
+          "directory accepted");
+    auto value = Pattern(4096, 7);
+    iovec input{value.data(), value.size()};
+    int fd = Take(adapter.OpenValidatedFile(path, capacity, canonical, true),
+                  "writer open");
+    Check(Take(adapter.WriteAt(fd, &input, 1, 37), "write") == value.size(),
+          "short write");
+    Take(adapter.CloseFile(fd), "writer close");
+    fd = Take(adapter.OpenValidatedFile(path, capacity, canonical, false),
+              "reader open");
+    Check(!adapter.WriteAt(fd, &input, 1, 37),
+          "read-only handle accepted write");
+    std::string got(value.size(), '\0');
+    iovec output{got.data(), got.size()};
+    Check(Take(adapter.ReadAt(fd, &output, 1, 37), "read") == got.size() &&
+              got == value,
+          "validated read mismatch");
+    Take(adapter.CloseFile(fd), "reader close");
+    Take(adapter.DeleteFile(path), "delete");
+    Take(adapter.PreallocateFile(path, capacity * 2), "recreate same path");
+    Check(!adapter.OpenValidatedFile(path, capacity, canonical, false),
+          "stale capacity used after recreate");
+    fd = Take(adapter.OpenValidatedFile(path, capacity * 2, canonical, false),
+              "recreated open");
+    Check(Take(adapter.ReadAt(fd, &output, 1, 37), "recreated read") ==
+                  got.size() &&
+              got == std::string(got.size(), '\0'),
+          "stale handle reused after recreate");
+    Take(adapter.CloseFile(fd), "recreated close");
+    Take(adapter.DeleteFile(path), "cleanup");
+    Take(adapter.Shutdown(), "shutdown");
+    std::cout << "COGNISTORE_VALIDATED_OPEN_PASS\n";
+}
 void AdapterTest(const std::string& root) {
     CogniStoreFsAdapter first, second;
     Take(first.Init(root), "adapter init");
@@ -768,6 +818,8 @@ int main(int argc, char** argv) {
         std::string mode = argv[1], root = argv[2];
         if (mode == "adapter")
             AdapterTest(root);
+        else if (mode == "validated-open")
+            ValidatedOpenTest(root);
         else if (mode == "batch-io")
             BatchIoTest(root);
         else if (mode == "full-stripe")

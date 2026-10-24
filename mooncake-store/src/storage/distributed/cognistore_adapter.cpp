@@ -319,39 +319,55 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::DeleteFile(
     return {};
 }
 
-tl::expected<int, ErrorCode> CogniStoreFsAdapter::Open(const std::string& path,
-                                                       int flags) {
+tl::expected<int, ErrorCode> CogniStoreFsAdapter::Open(
+    const std::string& path, int flags, std::optional<uint64_t> expected_size) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     std::lock_guard lock(runtime_->mutex);
     if (next_fd_ == INT_MAX)
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    // Allocate the map node before acquiring the SDK resource.
-    auto [it, inserted] = files_.emplace(next_fd_, File{});
+    // Reserve the ID before open: a failed close after validation must retain
+    // its SDK owner for Shutdown without colliding with a later open.
+    const int fd = next_fd_++;
+    auto [it, inserted] = files_.emplace(fd, File{});
     int rc = cogni_sdk_file_open(&runtime_->sdk, &it->second.sdk, path.c_str(),
                                  flags, 0644);
     if (rc) {
         files_.erase(it);
         return tl::make_unexpected(Translate(rc, ErrorCode::FILE_OPEN_FAIL));
     }
-    if ((flags & O_ACCMODE) != O_RDONLY) {
-        // Geometry is an optimization hint. Actual I/O still goes through the
-        // opened SDK File, which resolves and validates its current layout.
-        auto stat = Request<cogni_sdk_stat_req_v1>();
-        stat.path = Path(path);
-        ResultOwner metadata;
-        cogni_sdk_status_v1 status{};
-        cogni_sdk_inode_view_v1 view{};
-        view.struct_size = sizeof(view);
-        if (!cogni_sdk_stat_v1(&runtime_->sdk, &stat, &metadata.value, &status) &&
-            !cogni_sdk_result_inode_v1(&metadata.value, &view, &status)) {
-            const auto& layout = view.inode.layout;
-            const uint64_t bytes =
-                uint64_t(layout.chunk_size) * layout.data_fragments;
-            if (layout.parity_fragments && bytes && bytes <= kMaxStripeBytes)
-                it->second.stripe_bytes = size_t(bytes);
-        }
+    ResultOwner metadata;
+    cogni_sdk_status_v1 status{};
+    cogni_sdk_inode_view_v1 view{};
+    view.struct_size = sizeof(view);
+    rc = cogni_sdk_file_metadata_v1(&it->second.sdk, &metadata.value, &status);
+    if (!rc) rc = cogni_sdk_result_inode_v1(&metadata.value, &view, &status);
+    if (rc || (expected_size && view.inode.size != *expected_size)) {
+        const auto error = rc ? Translate(rc, ErrorCode::FILE_OPEN_FAIL)
+                              : ErrorCode::INVALID_PARAMS;
+        if (!cogni_sdk_file_close(&it->second.sdk)) files_.erase(it);
+        return tl::make_unexpected(error);
     }
-    return next_fd_++;
+    if ((flags & O_ACCMODE) != O_RDONLY) {
+        // This is the just-opened File's observation, not a cached path stat.
+        // Actual I/O still resolves and validates the current stripe layout.
+        const auto& layout = view.inode.layout;
+        const uint64_t bytes =
+            uint64_t(layout.chunk_size) * layout.data_fragments;
+        if (layout.parity_fragments && bytes && bytes <= kMaxStripeBytes)
+            it->second.stripe_bytes = size_t(bytes);
+    }
+    return fd;
+}
+tl::expected<int, ErrorCode> CogniStoreFsAdapter::OpenValidatedFile(
+    const std::string& path, uint64_t expected_size,
+    const std::string& canonical_root, bool write) {
+    auto canonical = CanonicalPath(path);
+    if (!canonical) return tl::make_unexpected(canonical.error());
+    const std::filesystem::path resolved(*canonical);
+    if (resolved.parent_path() != std::filesystem::path(canonical_root) ||
+        resolved.filename() != std::filesystem::path(path).filename())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return Open(*canonical, write ? O_RDWR : O_RDONLY, expected_size);
 }
 tl::expected<int, ErrorCode> CogniStoreFsAdapter::OpenFile(
     const std::string& path) {

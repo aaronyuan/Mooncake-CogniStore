@@ -32,6 +32,9 @@ class CogniStoreFsAdapter final : public FileSystemAdapter {
     tl::expected<int, ErrorCode> OpenExistingFile(const std::string&) override;
     tl::expected<int, ErrorCode> OpenExistingFileForRead(
         const std::string&) override;
+    tl::expected<int, ErrorCode> OpenValidatedFile(const std::string&, uint64_t,
+                                                   const std::string&,
+                                                   bool) override;
     tl::expected<void, ErrorCode> CloseFile(int) override;
     tl::expected<void, ErrorCode> PreallocateFile(const std::string&,
                                                   uint64_t) override;
@@ -60,7 +63,8 @@ class CogniStoreFsAdapter final : public FileSystemAdapter {
     std::shared_ptr<Runtime> runtime_;
     std::unordered_map<int, File> files_;
     int next_fd_{1};
-    tl::expected<int, ErrorCode> Open(const std::string&, int);
+    tl::expected<int, ErrorCode> Open(const std::string&, int,
+                                      std::optional<uint64_t> = std::nullopt);
     tl::expected<size_t, ErrorCode> Transfer(int, const iovec*, int, int64_t,
                                              bool);
 };

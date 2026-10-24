@@ -110,6 +110,24 @@ class FileSystemAdapter {
         return OpenExistingFile(path);
     }
 
+    // Validate bucket capacity and canonical namespace before opening an
+    // existing file. Adapters may reuse metadata returned by open itself.
+    virtual tl::expected<int, ErrorCode> OpenValidatedFile(
+        const std::string& path, uint64_t expected_size,
+        const std::string& canonical_root, bool write) {
+        auto size = GetFileSize(path);
+        if (!size) return tl::make_unexpected(size.error());
+        if (*size != expected_size)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        auto canonical = CanonicalPath(path);
+        if (!canonical) return tl::make_unexpected(canonical.error());
+        const std::filesystem::path resolved(*canonical);
+        if (resolved.parent_path() != std::filesystem::path(canonical_root) ||
+            resolved.filename() != std::filesystem::path(path).filename())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return write ? OpenExistingFile(path) : OpenExistingFileForRead(path);
+    }
+
     virtual tl::expected<void, ErrorCode> CloseFile(int /*fd*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }

@@ -99,6 +99,15 @@ The backend resolves the canonical root at initialization, while continuing to
 validate each opened bucket's canonical path, identity, and capacity. Changing
 the root symlink while a backend is alive is unsupported and fails validation.
 
+CogniStore validates capacity from the just-opened File's metadata and obtains
+EC geometry from the same observation, using `cogni_sdk_file_metadata_v1`.
+This avoids a separate size RPC before open and a layout stat after a writable
+open. Canonical path validation is still performed for every bucket, and an
+open never creates a missing bucket. The new SDK function copies locally
+observed metadata; it is not a fresh stat of another writer's changes. Build and
+run this adapter with a CogniStore SDK exporting that function. The ABI remains
+version 1 with one additive symbol; an older SDK shared library is insufficient.
+
 The adapter can combine a batch into one native SDK range when requests name
 the same file and their offsets are consecutive, with at most 16 MiB in total.
 Writes additionally require stripe-aligned offsets and an integral number of
