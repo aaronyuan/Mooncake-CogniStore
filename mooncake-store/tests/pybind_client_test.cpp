@@ -258,6 +258,127 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     }
 }
 
+TEST_F(RealClientTest, BatchGetIntoDfsRegisteredHostSkipsStaging) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_direct_dfs_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17829";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    const std::string key = "direct_dfs";
+    const std::string source(kObjectSize, 'v');
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+    auto query = py_client_->client_->Query(key);
+    ASSERT_TRUE(query);
+    ASSERT_EQ(query->replicas.size(), 1);
+    ASSERT_TRUE(query->replicas[0].is_dfs_replica());
+    const auto descriptor = query->replicas[0].get_dfs_descriptor();
+
+    // Interior pointers must fit entirely within the registered host range.
+    std::string destinations(2 * kObjectSize + 32, '?');
+    ASSERT_EQ(
+        py_client_->register_buffer(destinations.data(), destinations.size()),
+        0);
+    std::vector<void*> buffers{destinations.data() + 16,
+                               destinations.data() + 16 + kObjectSize};
+    std::vector<size_t> sizes(2, kObjectSize);
+    auto allocator = std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into(
+        {key, key, key}, {buffers[0], buffers[1], buffers[0]},
+        {kObjectSize, kObjectSize, kObjectSize});
+    py_client_->client_buffer_allocator_ = std::move(allocator);
+    EXPECT_EQ(results,
+              std::vector<int64_t>({kObjectSize, kObjectSize, kObjectSize}));
+    EXPECT_EQ(destinations.substr(16, kObjectSize), source);
+    EXPECT_EQ(destinations.substr(16 + kObjectSize, kObjectSize), source);
+    EXPECT_EQ(destinations.substr(0, 16), std::string(16, '?'));
+    EXPECT_EQ(destinations.substr(16 + 2 * kObjectSize), std::string(16, '?'));
+
+    // Ordinary host buffers, and registered regions too small for the whole
+    // object, still use staging. The underlying allocation is large enough.
+    std::string fallback(kObjectSize, '?');
+    EXPECT_EQ(
+        py_client_->batch_get_into({key}, {fallback.data()}, {fallback.size()}),
+        std::vector<int64_t>{kObjectSize});
+    EXPECT_EQ(fallback, source);
+    std::fill(fallback.begin(), fallback.end(), '?');
+    ASSERT_EQ(py_client_->register_buffer(fallback.data(), kObjectSize / 2), 0);
+    EXPECT_EQ(
+        py_client_->batch_get_into({key}, {fallback.data()}, {fallback.size()}),
+        std::vector<int64_t>{kObjectSize});
+    EXPECT_EQ(fallback, source);
+    EXPECT_EQ(py_client_->unregister_buffer(fallback.data()), 0);
+    EXPECT_EQ(
+        py_client_->batch_get_into({key}, {buffers[0]}, {kObjectSize - 1}),
+        std::vector<int64_t>{
+            static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS))});
+
+    if (const char* enabled = getenv("MOONCAKE_STORE_CHECKSUM");
+        enabled && std::string(enabled) == "1") {
+        ASSERT_TRUE(query->object_checksum);
+    }
+    if (query->object_checksum) {
+        std::vector<Replica::Descriptor> replicas = query->replicas;
+        QueryResult corrupted(std::move(replicas), query->lease_timeout,
+                              *query->object_checksum ^ uint64_t{1});
+        std::fill(destinations.begin(), destinations.end(), '?');
+        std::fill(fallback.begin(), fallback.end(), '?');
+        auto failures = py_client_->batch_get_into_internal(
+            {key, key, key}, {buffers[0], buffers[1], fallback.data()},
+            {kObjectSize, kObjectSize, kObjectSize},
+            {corrupted, corrupted, corrupted},
+            [](const std::string&, RealClient::LocalDiskOffloadObjects&)
+                -> tl::expected<void, ErrorCode> {
+                ADD_FAILURE() << "DFS unexpectedly routed through LOCAL_DISK";
+                return tl::unexpected(ErrorCode::RPC_FAIL);
+            });
+        ASSERT_EQ(failures.size(), 3);
+        for (const auto& failure : failures) {
+            ASSERT_FALSE(failure);
+            EXPECT_EQ(failure.error(), ErrorCode::CHECKSUM_MISMATCH);
+        }
+        // The duplicate must not receive unverified primary bytes.
+        EXPECT_EQ(destinations.substr(16 + kObjectSize, kObjectSize),
+                  std::string(kObjectSize, '?'));
+        EXPECT_EQ(fallback, std::string(kObjectSize, '?'));
+    }
+    std::filesystem::resize_file(descriptor.file_path,
+                                 descriptor.offset + kObjectSize / 2);
+    auto short_reads = py_client_->batch_get_into({key, key}, buffers, sizes);
+    EXPECT_EQ(short_reads,
+              std::vector<int64_t>(
+                  2, static_cast<int64_t>(toInt(ErrorCode::FILE_READ_FAIL))));
+    EXPECT_EQ(py_client_->unregister_buffer(destinations.data()), 0);
+}
+
 TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",

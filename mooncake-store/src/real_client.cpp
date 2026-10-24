@@ -6453,8 +6453,8 @@ RealClient::batch_get_into_internal(
             continue;
         }
         if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            // File-backed replicas cannot safely read directly into arbitrary
-            // user buffers. Use a contiguous temp buffer, then scatter.
+            // DFS may read directly into a registered host primary below;
+            // other destinations retain a temporary host buffer.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6539,7 +6539,8 @@ RealClient::batch_get_into_internal(
         FanOutDuplicates(dup_jobs, results);
     }
 
-    // ---- File-backed replicas: BatchGet into temp buffers, then scatter ----
+    // ---- File-backed replicas: verified primary read, then duplicate fan-out
+    // ----
     if (!disk_operations.empty()) {
         std::vector<std::string> disk_batch_keys;
         std::vector<QueryResult> disk_batch_qrs;
@@ -6547,9 +6548,8 @@ RealClient::batch_get_into_internal(
         std::vector<size_t> disk_batch_indices;
         std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
             disk_temp_handles;
-        // Duplicate keys share the first occurrence's temp buffer; the
-        // verified bytes are scattered into every duplicate destination
-        // after the batch read.
+        // Duplicate keys share the first occurrence's read, whether direct or
+        // staged. Only verified primary bytes are copied into duplicates.
         const auto disk_dedup = PlanDuplicateKeys(disk_operations);
 
         for (const size_t di : disk_dedup.primaries) {
@@ -6557,26 +6557,41 @@ RealClient::batch_get_into_internal(
             const auto &replica = op.replica;
             const char *replica_type =
                 replica.is_dfs_replica() ? "DFS" : "DISK";
-            auto alloc_result =
-                client_buffer_allocator_->allocate(op.total_size);
-            if (!alloc_result) {
-                LOG(ERROR) << "Failed to allocate temp buffer for "
-                           << replica_type << " read, key: " << op.key
-                           << ", size: " << op.total_size;
-                results[op.original_index] =
-                    tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-                continue;
+            bool direct_dfs_read = false;
+            if (replica.is_dfs_replica() && op.dst_buffer &&
+                !device::GetAcceleratorRegistry()
+                     .RuntimeAccelerators()
+                     .FindDeviceForPointer(op.dst_buffer)) {
+                const auto region =
+                    resolve_writable_buffer_region(op.dst_buffer);
+                direct_dfs_read =
+                    region && op.total_size <= region->size - region->offset;
             }
-            auto handle =
-                std::make_unique<BufferHandle>(std::move(*alloc_result));
+            std::unique_ptr<BufferHandle> handle;
+            void *target = op.dst_buffer;
+            if (!direct_dfs_read) {
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(op.total_size);
+                if (!alloc_result) {
+                    LOG(ERROR) << "Failed to allocate temp buffer for "
+                               << replica_type << " read, key: " << op.key
+                               << ", size: " << op.total_size;
+                    results[op.original_index] =
+                        tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                    continue;
+                }
+                handle =
+                    std::make_unique<BufferHandle>(std::move(*alloc_result));
+                target = handle->ptr();
+            }
             std::vector<Slice> disk_slices;
-            allocateSlices(disk_slices, replica, handle->ptr());
+            allocateSlices(disk_slices, replica, target);
             disk_batch_keys.push_back(op.key);
             disk_batch_qrs.push_back(
                 FilterQueryResult(op.query_result, replica));
             disk_batch_slices[op.key] = std::move(disk_slices);
             disk_batch_indices.push_back(di);
-            disk_temp_handles.emplace(op.key, std::move(handle));
+            if (handle) disk_temp_handles.emplace(op.key, std::move(handle));
         }
 
         if (!disk_batch_keys.empty()) {
@@ -6597,6 +6612,9 @@ RealClient::batch_get_into_internal(
                         tl::unexpected(disk_results[di].error());
                     continue;
                 }
+                // BatchGet has already checked checksum and lease. Direct
+                // destinations, as with memory reads, are unspecified on error.
+                if (handle_it == disk_temp_handles.end()) continue;
                 if (auto r = scatter_host_to_maybe_device(
                         op.dst_buffer,
                         static_cast<char *>(handle_it->second->ptr()),
@@ -6619,16 +6637,17 @@ RealClient::batch_get_into_internal(
                 .dup_bytes = dup_op.total_size,
                 .primary_bytes = primary_op.total_size,
                 .copy = [&disk_temp_handles, dst = dup_op.dst_buffer,
+                         primary = primary_op.dst_buffer,
                          size = dup_op.total_size, key = dup_op.key,
                          is_dfs = dup_op.replica.is_dfs_replica()]()
                     -> tl::expected<void, ErrorCode> {
                     auto handle_it = disk_temp_handles.find(key);
-                    if (handle_it == disk_temp_handles.end()) {
-                        return tl::make_unexpected(
-                            ErrorCode::NO_AVAILABLE_HANDLE);
-                    }
+                    const void *source = handle_it == disk_temp_handles.end()
+                                             ? primary
+                                             : handle_it->second->ptr();
+                    if (dst == source) return {};
                     return CopyMaybeDevice(
-                        dst, handle_it->second->ptr(), size,
+                        dst, source, size,
                         std::string(is_dfs ? "DFS" : "DISK") +
                             " duplicate read, key: " + key);
                 }});

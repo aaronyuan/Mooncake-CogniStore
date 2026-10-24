@@ -264,6 +264,13 @@ add_store_test(real_client_hugepage_register_test real_client_hugepage_register_
 add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
+add_test(
+  NAME pybind_dfs_direct_read_test
+  COMMAND pybind_client_test
+    "--gtest_filter=RealClientTest.BatchGetIntoDfsRegisteredHostSkipsStaging"
+)
+set_tests_properties(pybind_dfs_direct_read_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(standalone_client_test standalone_client_test.cpp)
 add_store_test(embedded_master_test embedded_master_test.cpp)
 if(USE_TENT)

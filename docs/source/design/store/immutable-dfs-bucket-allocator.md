@@ -125,6 +125,15 @@ Runtime. Operations on the same File handle remain exclusive, and normal close
 waits for its retained transfer to finish. Reads and partial-write fallback keep
 their serialization. Applications must stop submitting before shutdown.
 
+For `batch_get_into`, DFS can read directly into a host destination fully covered
+by a known writable registration or the client's local buffer region. This
+avoids one Mooncake staging allocation and copy. Device destinations, unknown
+host ranges and DISK replicas retain staging. Duplicate keys still share one
+primary read, with checksum and lease validation before successful fan-out.
+As with other direct reads, the primary destination is unspecified on failure;
+callers must check each result. The CogniStore adapter still uses its own SDK
+buffers, so this is not zero-copy across the complete storage path.
+
 SDK `io_jobq_size` also bounds retained cleanup resources, including open files,
 IORs and promotion work. Size it for the live handles as well as queued jobs;
 the multi-handle Wuxi regression uses 128. The old value of 24 exhausted that
