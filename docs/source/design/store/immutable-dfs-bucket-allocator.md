@@ -107,6 +107,21 @@ future batch is introduced. Reads larger than 1 MiB can be coalesced without
 stripe alignment; the returned byte count is scattered to each request, and
 bytes past EOF remain untouched. Other requests fall back to batches of up to
 eight 1 MiB SDK operations. Successful writes retain their SDK `fsync` boundary.
+
+Up to four independent full-stripe write batches can wait for SDK I/O in
+parallel within the same process Runtime. Each admitted batch owns a registered
+buffer and a read/write IOR pair; these resources are allocated lazily, with at
+most 64 MiB of stripe buffers plus the existing 8 MiB fallback buffer per
+Runtime. Operations on the same File handle remain exclusive, and normal close
+waits for its retained transfer to finish. Reads and partial-write fallback keep
+their serialization. Applications must stop submitting before shutdown.
+
+SDK `io_jobq_size` also bounds retained cleanup resources, including open files,
+IORs and promotion work. Size it for the live handles as well as queued jobs;
+the multi-handle Wuxi regression uses 128. The old value of 24 exhausted that
+budget and caused `fsync` to return `EBUSY`. The adapter preserves errors instead
+of retrying unknown outcomes or reporting the affected KV as successful.
+
 For a new EC bucket with known geometry, initialization writes zeros only to
 its final data stripe (or the used part of that stripe), then completes `fsync`,
 close and the exact file-size check before publishing the bucket. Earlier ranges

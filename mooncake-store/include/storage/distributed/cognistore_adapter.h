@@ -10,7 +10,9 @@ namespace mooncake {
 // Initial synchronous, copy-based bridge to the process-local SDK C ABI.
 // Bucket batching reuses handles and submits bounded SDK I/O batches.
 // Contiguous aligned writes coalesce into full stripes (up to 16 MiB).
-// Stale-fd retries remain disabled.
+// Up to four coalesced writes have independent buffers/IORs in one Runtime.
+// Reads and partial-write fallback retain their serialization.
+// Close drains retained transfers. Stale-fd retries remain disabled.
 class CogniStoreFsAdapter final : public FileSystemAdapter {
    public:
     CogniStoreFsAdapter();
@@ -49,6 +51,8 @@ class CogniStoreFsAdapter final : public FileSystemAdapter {
     std::optional<std::vector<tl::expected<size_t, ErrorCode>>> CoalescedTransfer(
         std::span<const FdIoRequest>, bool read);
     struct File {
+        size_t active{0};
+        bool closing{false};
         cogni_sdk_file sdk{};
         size_t stripe_bytes{0};
     };

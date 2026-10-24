@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
@@ -56,12 +58,40 @@ struct CogniStoreFsAdapter::Runtime {
     std::string config;
     pid_t pid{::getpid()};
     cogni_sdk sdk{};
-    cogni_sdk_iov iov{}, stripe_iov{};
+    cogni_sdk_iov iov{};
     cogni_sdk_ior read{}, write{}, batch_read{}, batch_write{};
     void* buffer{nullptr};
-    void* stripe_buffer{nullptr};
+    struct StripeIo {
+        cogni_sdk_iov iov{};
+        cogni_sdk_ior read{}, write{};
+        void* buffer{nullptr};
+        bool busy{false};
+
+        int Start(cogni_sdk& sdk, int numa) {
+            if (iov.private_data && read.private_data && write.private_data)
+                return 0;
+            // A failed registration can retain an unknown owner until shutdown.
+            if (buffer) return -EIO;
+            if (posix_memalign(&buffer, 4096, kMaxStripeBytes)) return -ENOMEM;
+            std::memset(buffer, 0, kMaxStripeBytes);
+            int rc = cogni_sdk_iov_register(&sdk, &iov, buffer, kMaxStripeBytes,
+                                            kMaxStripeBytes, numa);
+            if (rc) return rc;
+            rc = cogni_sdk_ior_create(&sdk, &read, 1, 1, 1, 1, 30000, 0);
+            if (rc) return rc;
+            return cogni_sdk_ior_create(&sdk, &write, 1, 0, 1, 1, 30000, 0);
+        }
+        void Drain() {
+            if (read.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&read), 0);
+            if (write.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&write), 0);
+            if (iov.private_data) CHECK_EQ(cogni_sdk_iov_release(&iov), 0);
+        }
+    };
+    // Independent producers share the SDK, but never an active buffer or IOR.
+    std::array<StripeIo, 4> stripes;
+    std::condition_variable idle;
     int numa{-1};
-    bool poisoned{false};
+    std::atomic<bool> poisoned{false};
 
     int Start(const std::string& path) {
         config = path;
@@ -95,16 +125,6 @@ struct CogniStoreFsAdapter::Runtime {
         return cogni_sdk_ior_create(&sdk, &batch_write, kBatchEntries, 0,
                                     -int(kBatchEntries), 1, 1, 0);
     }
-    int EnsureStripeBuffer() {
-        if (stripe_iov.private_data) return 0;
-        // A failed registration can retain an unknown SDK owner. Keep that
-        // allocation until shutdown and never reuse it for another attempt.
-        if (stripe_buffer) return -EIO;
-        if (posix_memalign(&stripe_buffer, 4096, kMaxStripeBytes)) return -ENOMEM;
-        std::memset(stripe_buffer, 0, kMaxStripeBytes);
-        return cogni_sdk_iov_register(&sdk, &stripe_iov, stripe_buffer,
-                                      kMaxStripeBytes, kMaxStripeBytes, numa);
-    }
     ~Runtime() {
         // Fail closed rather than freeing buffers still owned by an unknown
         // I/O.
@@ -112,11 +132,11 @@ struct CogniStoreFsAdapter::Runtime {
         if (batch_write.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&batch_write), 0);
         if (read.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&read), 0);
         if (write.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&write), 0);
-        if (stripe_iov.private_data) CHECK_EQ(cogni_sdk_iov_release(&stripe_iov), 0);
+        for (auto& stripe : stripes) stripe.Drain();
         if (iov.private_data) CHECK_EQ(cogni_sdk_iov_release(&iov), 0);
         if (sdk.private_data) CHECK_EQ(cogni_sdk_shutdown(&sdk), 0);
         std::free(buffer);
-        std::free(stripe_buffer);
+        for (auto& stripe : stripes) std::free(stripe.buffer);
     }
 };
 
@@ -187,7 +207,14 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::Init(
 tl::expected<void, ErrorCode> CogniStoreFsAdapter::Shutdown() {
     if (!runtime_) return {};
     {
-        std::lock_guard lock(runtime_->mutex);
+        std::unique_lock lock(runtime_->mutex);
+        for (auto& [fd, file] : files_) file.closing = true;
+        runtime_->idle.notify_all();
+        runtime_->idle.wait(lock, [&] {
+            return std::all_of(
+                files_.begin(), files_.end(),
+                [](const auto& item) { return item.second.active == 0; });
+        });
         for (auto it = files_.begin(); it != files_.end();) {
             int rc = cogni_sdk_file_close(&it->second.sdk);
             if (rc)
@@ -340,15 +367,21 @@ tl::expected<int, ErrorCode> CogniStoreFsAdapter::OpenExistingFileForRead(
 }
 tl::expected<void, ErrorCode> CogniStoreFsAdapter::CloseFile(int fd) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    std::lock_guard lock(runtime_->mutex);
+    std::unique_lock lock(runtime_->mutex);
     auto it = files_.find(fd);
-    if (it == files_.end())
+    if (it == files_.end() || it->second.closing)
         return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    int rc = cogni_sdk_file_close(&it->second.sdk);
-    if (rc)
+    auto* file = &it->second;
+    file->closing = true;
+    runtime_->idle.notify_all();
+    runtime_->idle.wait(lock, [&] { return file->active == 0; });
+    int rc = cogni_sdk_file_close(&file->sdk);
+    if (rc) {
+        file->closing = false;
         return tl::make_unexpected(
             Translate(rc, ErrorCode::FILE_INVALID_HANDLE));
-    files_.erase(it);
+    }
+    files_.erase(fd);
     return {};
 }
 
@@ -364,9 +397,14 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::Transfer(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         total += vectors[i].iov_len;
     }
-    std::lock_guard lock(runtime_->mutex);
+    std::unique_lock lock(runtime_->mutex);
+    runtime_->idle.wait(lock, [&] {
+        auto current = files_.find(fd);
+        return current == files_.end() || current->second.closing ||
+               !current->second.active;
+    });
     auto it = files_.find(fd);
-    if (it == files_.end())
+    if (it == files_.end() || it->second.closing)
         return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     const auto failure =
         read ? ErrorCode::FILE_READ_FAIL : ErrorCode::FILE_WRITE_FAIL;
@@ -431,7 +469,7 @@ std::optional<std::vector<tl::expected<size_t, ErrorCode>>>
 CogniStoreFsAdapter::CoalescedTransfer(
     std::span<const FdIoRequest> requests, bool read) {
     if (requests.empty() || !runtime_) return std::nullopt;
-    std::lock_guard lock(runtime_->mutex);
+    std::unique_lock lock(runtime_->mutex);
     auto file = files_.find(requests.front().fd);
     if (file == files_.end() || (!read && !file->second.stripe_bytes))
         return std::nullopt;
@@ -467,15 +505,49 @@ CogniStoreFsAdapter::CoalescedTransfer(
             result = tl::make_unexpected(Translate(rc, failure));
         return results;
     };
+    Runtime::StripeIo* stripe = nullptr;
+    const int fd = requests.front().fd;
+    runtime_->idle.wait(lock, [&] {
+        auto current = files_.find(fd);
+        if (runtime_->poisoned || current == files_.end() ||
+            current->second.closing)
+            return true;
+        // The C ABI requires external synchronization for each File handle.
+        if (current->second.active) return false;
+        for (auto& candidate : runtime_->stripes) {
+            if (!candidate.busy) {
+                stripe = &candidate;
+                return true;
+            }
+        }
+        return false;
+    });
     if (runtime_->poisoned) return fail(-EIO);
-    int rc = runtime_->EnsureStripeBuffer();
+    file = files_.find(fd);
+    if (file == files_.end() || file->second.closing) return fail(-EBADF);
+    int rc = stripe->Start(runtime_->sdk, runtime_->numa);
     if (rc) return fail(rc);
+    // Map element addresses survive rehash. Close waits for this retained use.
+    auto* retained = &file->second;
+    ++retained->active;
+    stripe->busy = true;
+    auto release = [&](Runtime::StripeIo* used) {
+        if (!lock.owns_lock()) lock.lock();
+        --retained->active;
+        used->busy = false;
+        runtime_->idle.notify_all();
+    };
+    std::unique_ptr<Runtime::StripeIo, decltype(release)> lease(stripe,
+                                                                release);
+    // Keep the read path's serialization and single-buffer locality. Allow
+    // independent full-stripe writes to overlap their SDK completion waits.
+    if (!read) lock.unlock();
     if (!read) {
         size_t copied = 0;
         for (const auto& r : requests) {
             for (int i = 0; i < r.iovcnt; ++i) {
                 if (r.iov[i].iov_len)
-                    std::memcpy(static_cast<char*>(runtime_->stripe_buffer) + copied,
+                    std::memcpy(static_cast<char*>(stripe->buffer) + copied,
                                 r.iov[i].iov_base, r.iov[i].iov_len);
                 copied += r.iov[i].iov_len;
             }
@@ -483,9 +555,9 @@ CogniStoreFsAdapter::CoalescedTransfer(
     }
     // One range operation. Writes use only exact caller bytes, without padding.
     // Contiguous reads use one SDK request even across adjacent KV boundaries.
-    auto* ring = read ? &runtime_->read : &runtime_->write;
-    int index = cogni_sdk_prep_io(ring, &file->second.sdk,
-                                 &runtime_->stripe_iov, offset, 0, total, nullptr);
+    auto* ring = read ? &stripe->read : &stripe->write;
+    int index = cogni_sdk_prep_io(ring, &retained->sdk, &stripe->iov, offset, 0,
+                                  total, nullptr);
     if (index < 0) return fail(index);
     rc = cogni_sdk_submit_ios(ring);
     if (rc) {
@@ -509,9 +581,7 @@ CogniStoreFsAdapter::CoalescedTransfer(
                 const auto n = std::min(v.iov_len, remaining);
                 if (n)
                     std::memcpy(v.iov_base,
-                                static_cast<char*>(runtime_->stripe_buffer) +
-                                    copied,
-                                n);
+                                static_cast<char*>(stripe->buffer) + copied, n);
                 copied += n;
                 remaining -= n;
             }
@@ -523,7 +593,8 @@ CogniStoreFsAdapter::CoalescedTransfer(
         return results;
     }
     if (size_t(cqe.result) != total) return fail(-EIO);
-    rc = cogni_sdk_file_fsync(&file->second.sdk);
+    // This File handle remains exclusive through the fsync acknowledgement.
+    rc = cogni_sdk_file_fsync(&retained->sdk);
     if (rc) return fail(rc);
     VLOG(1) << "CogniStore full-stripe write bytes=" << total
             << " requests=" << requests.size() << " offset=" << offset;
@@ -577,7 +648,15 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
             }
             continue;
         }
-        std::lock_guard lock(runtime_->mutex);
+        std::unique_lock lock(runtime_->mutex);
+        runtime_->idle.wait(lock, [&] {
+            return std::all_of(
+                wave.begin(), wave.end(), [&](const auto& request) {
+                    auto file = files_.find(request.fd);
+                    return file == files_.end() || file->second.closing ||
+                           !file->second.active;
+                });
+        });
         if (runtime_->poisoned) break;
         auto* ring = read ? &runtime_->batch_read : &runtime_->batch_write;
         std::array<int, kBatchEntries> indices;
@@ -586,7 +665,7 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
         for (size_t i = 0; i < wave.size(); ++i) {
             const auto& r = wave[i];
             auto file = files_.find(r.fd);
-            if (file == files_.end()) {
+            if (file == files_.end() || file->second.closing) {
                 results[start + i] = tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
                 continue;
             }

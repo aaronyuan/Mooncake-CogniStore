@@ -2,6 +2,7 @@
 // cluster.
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -358,6 +359,96 @@ void FullStripeTest(const std::string& root) {
     std::cout << "COGNISTORE_FULL_STRIPE_PASS stripe_bytes=16777216 objects=16"
                  " full=2 partial=1 gapped=1 unaligned=1 tail=17" << std::endl;
 }
+// More callers than stripe contexts exercise admission, shared fd lifetime,
+// distinct payload ownership and mixed fallback I/O in one SDK Runtime.
+void ParallelStripeTest(const std::string& root) {
+    constexpr size_t lanes = 8, stripe = 16 * 1024 * 1024;
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "parallel init");
+    const auto path = root + "/parallel";
+    Take(adapter.PreallocateFile(path, lanes * stripe), "parallel preallocate");
+    int fd = Take(adapter.OpenExistingFile(path), "parallel writer");
+    int ro = Take(adapter.OpenExistingFileForRead(path), "parallel reader");
+    std::array<int, lanes> writers, readers;
+    for (size_t i = 0; i < lanes; ++i) {
+        writers[i] =
+            Take(adapter.OpenExistingFile(path), "parallel independent writer");
+        readers[i] = Take(adapter.OpenExistingFileForRead(path),
+                          "parallel independent reader");
+    }
+    std::barrier start(int(lanes) + 1);
+    std::array<std::exception_ptr, lanes> errors{};
+    std::vector<std::thread> workers;
+    for (size_t lane = 0; lane < lanes; ++lane) {
+        workers.emplace_back([&, lane] {
+            start.arrive_and_wait();
+            try {
+                for (size_t round = 0; round < 2; ++round) {
+                    auto value = Pattern(stripe, lane + 100 * round);
+                    std::string got(stripe, char(0xcd));
+                    iovec source{value.data(), stripe},
+                        dest{got.data(), stripe};
+                    const int writer = round ? writers[lane] : fd;
+                    const int reader = round ? readers[lane] : ro;
+                    FdIoRequest write{writer, &source, 1,
+                                      int64_t(lane * stripe)};
+                    FdIoRequest read{reader, &dest, 1, int64_t(lane * stripe)};
+                    Check(Take(adapter.BatchWriteAt({&write, 1}).front(),
+                               "parallel write lane=" + std::to_string(lane) +
+                                   " round=" + std::to_string(round)) == stripe,
+                          "parallel short write");
+                    // One lane's small write overlaps its own full stripe while
+                    // other lanes continue full writes to disjoint stripes.
+                    if (lane % 2 == 0) {
+                        auto patch = Pattern(4096, lane + round + 700);
+                        iovec small{patch.data(), patch.size()};
+                        Take(adapter.WriteAt(writer, &small, 1,
+                                             lane * stripe + 37),
+                             "parallel partial");
+                        value.replace(37, patch.size(), patch);
+                    }
+                    Check(Take(adapter.BatchReadAt({&read, 1}).front(),
+                               "parallel read") == stripe &&
+                              got == value,
+                          "parallel payload mismatch");
+                }
+            } catch (...) {
+                errors[lane] = std::current_exception();
+            }
+        });
+    }
+    start.arrive_and_wait();
+    for (auto& worker : workers) worker.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+    for (size_t i = 0; i < lanes; ++i) {
+        Take(adapter.CloseFile(writers[i]),
+             "parallel independent writer close");
+        Take(adapter.CloseFile(readers[i]),
+             "parallel independent reader close");
+    }
+    Take(adapter.CloseFile(fd), "parallel close writer");
+    Take(adapter.CloseFile(ro), "parallel close reader");
+    ro = Take(adapter.OpenExistingFileForRead(path), "parallel reopen");
+    for (size_t lane = 0; lane < lanes; ++lane) {
+        auto expected = Pattern(stripe, lane + 100);
+        if (lane % 2 == 0)
+            expected.replace(37, 4096, Pattern(4096, lane + 701));
+        std::string got(stripe, char(0xcd));
+        iovec dest{got.data(), stripe};
+        FdIoRequest read{ro, &dest, 1, int64_t(lane * stripe)};
+        Check(Take(adapter.BatchReadAt({&read, 1}).front(),
+                   "parallel committed read") == stripe &&
+                  got == expected,
+              "parallel committed mismatch");
+    }
+    Take(adapter.CloseFile(ro), "parallel final close");
+    Take(adapter.DeleteFile(path), "parallel cleanup");
+    std::cout << "COGNISTORE_PARALLEL_STRIPE_PASS lanes=8 rounds=2 shared_fd=1 "
+                 "independent_fd=8 partial=8"
+              << std::endl;
+}
+
 // Establish a multi-stripe bucket without requiring physical zero writes for
 // its holes. Check EOF, every hole and out-of-order writes through a fresh fd.
 void SparseBucketTest(const std::string& root) {
@@ -681,6 +772,8 @@ int main(int argc, char** argv) {
             BatchIoTest(root);
         else if (mode == "full-stripe")
             FullStripeTest(root);
+        else if (mode == "parallel-stripe")
+            ParallelStripeTest(root);
         else if (mode == "sparse-bucket")
             SparseBucketTest(root);
         else if (mode == "small-io")
