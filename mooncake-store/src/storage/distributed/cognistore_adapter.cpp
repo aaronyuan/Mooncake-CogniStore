@@ -71,13 +71,14 @@ struct AdapterProfile {
         ReadCopy,
         ReadReleaseLock,
         ReadTotal,
+        BucketCreate,
         Count
     };
     static constexpr const char* names[Count] = {
-        "path_lock",         "path_sdk",   "open_lock", "open_sdk",
-        "close_lock",        "close_idle", "close_sdk", "read_lock",
-        "read_idle",         "read_setup", "read_wait", "read_copy",
-        "read_release_lock", "read_total"};
+        "path_lock",         "path_sdk",   "open_lock",    "open_sdk",
+        "close_lock",        "close_idle", "close_sdk",    "read_lock",
+        "read_idle",         "read_setup", "read_wait",    "read_copy",
+        "read_release_lock", "read_total", "bucket_create"};
     struct Counter {
         std::atomic<uint64_t> calls{0}, ns{0};
     };
@@ -941,6 +942,9 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::PreallocateFile(
     const std::string& path, uint64_t size) {
     if (!size || size > INT64_MAX)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
+    // Includes open, tail initialization, fsync, close and size verification.
+    ProfileScope create_time(runtime_->profile, AdapterProfile::BucketCreate);
     auto opened = Open(path, O_RDWR | O_CREAT | O_EXCL);
     if (!opened) return tl::make_unexpected(opened.error());
     std::vector<char> zeros(std::min<uint64_t>(size, kBufferSize), 0);
