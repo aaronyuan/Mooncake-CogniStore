@@ -499,6 +499,60 @@ void ParallelStripeTest(const std::string& root) {
               << std::endl;
 }
 
+// Concurrent open/read/close must preserve File, IOR and destination ownership
+// while a coalesced reader releases the Runtime mutex for completion/copy.
+void ReadAdmissionTest(const std::string& root) {
+    constexpr size_t lanes = 8, stripe = 16 * 1024 * 1024;
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "read admission init");
+    const auto path = root + "/read-admission";
+    const auto canonical = Take(adapter.CanonicalPath(root), "canonical root");
+    auto value = Pattern(stripe, 813);
+    Take(adapter.PreallocateFile(path, stripe), "read admission preallocate");
+    int fd = Take(adapter.OpenExistingFile(path), "read admission writer");
+    iovec source{value.data(), value.size()};
+    FdIoRequest write{fd, &source, 1, 0};
+    Check(Take(adapter.BatchWriteAt({&write, 1}).front(), "seed read data") ==
+              stripe,
+          "short read fixture write");
+    Take(adapter.CloseFile(fd), "read fixture close");
+    std::barrier start{int(lanes)};
+    std::array<std::exception_ptr, lanes> errors{};
+    std::vector<std::thread> workers;
+    for (size_t lane = 0; lane < lanes; ++lane) {
+        workers.emplace_back([&, lane] {
+            start.arrive_and_wait();
+            try {
+                for (size_t round = 0; round < 4; ++round) {
+                    const int reader = Take(adapter.OpenValidatedFile(
+                                                path, stripe, canonical, false),
+                                            "concurrent open");
+                    // Mix the shared fallback buffer with coalesced reads.
+                    const size_t bytes = lane % 2 ? stripe : 1024 * 1024;
+                    std::string got(bytes, char(0xcd));
+                    iovec dest{got.data(), bytes};
+                    FdIoRequest read{reader, &dest, 1, 0};
+                    const auto result = adapter.BatchReadAt({&read, 1});
+                    Take(adapter.CloseFile(reader), "concurrent read close");
+                    Check(Take(result.front(), "concurrent read") == bytes &&
+                              got == value.substr(0, bytes),
+                          "concurrent read payload mismatch");
+                }
+            } catch (...) {
+                errors[lane] = std::current_exception();
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+    Take(adapter.DeleteFile(path), "read admission cleanup");
+    Take(adapter.Shutdown(), "read admission shutdown");
+    std::cout << "COGNISTORE_READ_ADMISSION_PASS lanes=8 rounds=4 "
+                 "coalesced=16 fallback=16"
+              << std::endl;
+}
+
 // Establish a multi-stripe bucket without requiring physical zero writes for
 // its holes. Check EOF, every hole and out-of-order writes through a fresh fd.
 void SparseBucketTest(const std::string& root) {
@@ -826,6 +880,8 @@ int main(int argc, char** argv) {
             FullStripeTest(root);
         else if (mode == "parallel-stripe")
             ParallelStripeTest(root);
+        else if (mode == "read-admission")
+            ReadAdmissionTest(root);
         else if (mode == "sparse-bucket")
             SparseBucketTest(root);
         else if (mode == "small-io")

@@ -122,8 +122,12 @@ parallel within the same process Runtime. Each admitted batch owns a registered
 buffer and a read/write IOR pair; these resources are allocated lazily, with at
 most 64 MiB of stripe buffers plus the existing 8 MiB fallback buffer per
 Runtime. Operations on the same File handle remain exclusive, and normal close
-waits for its retained transfer to finish. Reads and partial-write fallback keep
-their serialization. Applications must stop submitting before shutdown.
+waits for its retained transfer to finish. One coalesced reader is admitted at a
+time; it releases the Runtime mutex during SDK I/O and scatter copies, allowing
+metadata operations on other handles to proceed. Its File, buffer and IOR remain
+exclusive until completion. Partial-write and small-read fallback retain the
+Runtime mutex and their shared buffer. Applications must stop submitting before
+shutdown.
 
 For diagnostic runs, set `MOONCAKE_COGNISTORE_PROFILE=1` before Runtime
 initialization. Shutdown emits one `COGNISTORE_ADAPTER_PROFILE` JSON record with

@@ -166,6 +166,7 @@ struct CogniStoreFsAdapter::Runtime {
     // Independent producers share the SDK, but never an active buffer or IOR.
     std::array<StripeIo, 4> stripes;
     std::condition_variable idle;
+    bool coalesced_read_busy{false};
     int numa{-1};
     std::atomic<bool> poisoned{false};
 
@@ -635,7 +636,8 @@ CogniStoreFsAdapter::CoalescedTransfer(
             current->second.closing)
             return true;
         // The C ABI requires external synchronization for each File handle.
-        if (current->second.active) return false;
+        if (current->second.active || (read && runtime_->coalesced_read_busy))
+            return false;
         for (auto& candidate : runtime_->stripes) {
             if (!candidate.busy) {
                 stripe = &candidate;
@@ -656,6 +658,7 @@ CogniStoreFsAdapter::CoalescedTransfer(
     auto* retained = &file->second;
     ++retained->active;
     stripe->busy = true;
+    if (read) runtime_->coalesced_read_busy = true;
     auto release = [&](Runtime::StripeIo* used) {
         ProfileScope release_wait(runtime_->profile,
                                   AdapterProfile::ReadReleaseLock, read);
@@ -663,13 +666,15 @@ CogniStoreFsAdapter::CoalescedTransfer(
         release_wait.Stop();
         --retained->active;
         used->busy = false;
+        if (read) runtime_->coalesced_read_busy = false;
         runtime_->idle.notify_all();
     };
     std::unique_ptr<Runtime::StripeIo, decltype(release)> lease(stripe,
                                                                 release);
-    // Keep the read path's serialization and single-buffer locality. Allow
-    // independent full-stripe writes to overlap their SDK completion waits.
-    if (!read) lock.unlock();
+    // Retain one coalesced reader and its buffer locality, but let metadata
+    // operations on other handles proceed during SDK waits and scatter copies.
+    // The lease keeps this File and IOR exclusive until completion.
+    lock.unlock();
     if (!read) {
         size_t copied = 0;
         for (const auto& r : requests) {
