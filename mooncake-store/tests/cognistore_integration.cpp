@@ -516,6 +516,11 @@ void ParallelStripeTest(const std::string& root) {
                               got == value,
                           "parallel payload mismatch");
                     if (round) {
+                        Check(
+                            Take(adapter.FileExists(path), "parallel exists") &&
+                                Take(adapter.GetFileSize(path),
+                                     "parallel size") == lanes * stripe,
+                            "parallel metadata mismatch");
                         Take(adapter.CloseFile(writer),
                              "parallel writer close");
                         Take(adapter.CloseFile(reader),

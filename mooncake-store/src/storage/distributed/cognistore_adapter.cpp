@@ -133,6 +133,8 @@ using ProfileScope = AdapterProfile::Scope;
 
 struct CogniStoreFsAdapter::Runtime {
     std::mutex mutex;
+    // Serialize shared SDK-handle operations without blocking File/IOR leases.
+    std::mutex sdk_mutex;
     AdapterProfile profile;
     std::string config;
     pid_t pid{::getpid()};
@@ -266,7 +268,7 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::Init(
     }
     int rc;
     {
-        std::lock_guard lock(runtime_->mutex);
+        std::lock_guard lock(runtime_->sdk_mutex);
         auto request = Request<cogni_sdk_mkdirs_req_v1>();
         request.path = Path(root);
         request.permissions = 0755;
@@ -321,7 +323,7 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::Shutdown() {
 tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::GetFileSize(
     const std::string& path) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    std::lock_guard lock(runtime_->mutex);
+    std::lock_guard lock(runtime_->sdk_mutex);
     uint64_t size = 0;
     int rc = cogni_sdk_file_size(&runtime_->sdk, path.c_str(), &size);
     if (rc)
@@ -333,7 +335,7 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::GetFileSize(
 tl::expected<bool, ErrorCode> CogniStoreFsAdapter::FileExists(
     const std::string& path) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    std::lock_guard lock(runtime_->mutex);
+    std::lock_guard lock(runtime_->sdk_mutex);
     auto request = Request<cogni_sdk_stat_req_v1>();
     request.path = Path(path);
     ResultOwner result;
@@ -349,7 +351,7 @@ tl::expected<std::string, ErrorCode> CogniStoreFsAdapter::CanonicalPath(
     const std::string& path) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     ProfileScope lock_wait(runtime_->profile, AdapterProfile::PathLock);
-    std::lock_guard lock(runtime_->mutex);
+    std::lock_guard lock(runtime_->sdk_mutex);
     lock_wait.Stop();
     auto request = Request<cogni_sdk_get_real_path_req_v1>();
     request.path = Path(path);
@@ -371,7 +373,7 @@ tl::expected<std::string, ErrorCode> CogniStoreFsAdapter::CanonicalPath(
 tl::expected<std::vector<std::string>, ErrorCode>
 CogniStoreFsAdapter::ListFiles(const std::string& path) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    std::lock_guard lock(runtime_->mutex);
+    std::lock_guard lock(runtime_->sdk_mutex);
     std::vector<std::string> names;
     std::string previous;
     for (;;) {
@@ -407,7 +409,7 @@ CogniStoreFsAdapter::ListFiles(const std::string& path) {
 tl::expected<void, ErrorCode> CogniStoreFsAdapter::DeleteFile(
     const std::string& path) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    std::lock_guard lock(runtime_->mutex);
+    std::lock_guard lock(runtime_->sdk_mutex);
     int rc = cogni_sdk_remove(&runtime_->sdk, path.c_str());
     if (rc)
         return tl::make_unexpected(Translate(rc, ErrorCode::FILE_WRITE_FAIL));
@@ -417,33 +419,44 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::DeleteFile(
 tl::expected<int, ErrorCode> CogniStoreFsAdapter::Open(
     const std::string& path, int flags, std::optional<uint64_t> expected_size) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
-    ProfileScope lock_wait(runtime_->profile, AdapterProfile::OpenLock);
-    std::lock_guard lock(runtime_->mutex);
-    lock_wait.Stop();
+    std::unique_lock lock(runtime_->mutex);
     if (next_fd_ == INT_MAX)
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     // Reserve the ID before open: a failed close after validation must retain
     // its SDK owner for Shutdown without colliding with a later open.
     const int fd = next_fd_++;
     auto [it, inserted] = files_.emplace(fd, File{});
-    ProfileScope sdk_time(runtime_->profile, AdapterProfile::OpenSdk);
-    int rc = cogni_sdk_file_open(&runtime_->sdk, &it->second.sdk, path.c_str(),
+    auto* file = &it->second;
+    ++file->active;
+    // The fd is private until Open returns. Pin it for Shutdown while the
+    // shared SDK handle waits for metadata, without blocking unrelated I/O.
+    lock.unlock();
+    int rc;
+    {
+        ProfileScope lock_wait(runtime_->profile, AdapterProfile::OpenLock);
+        std::lock_guard sdk_lock(runtime_->sdk_mutex);
+        lock_wait.Stop();
+        ProfileScope sdk_time(runtime_->profile, AdapterProfile::OpenSdk);
+        rc = cogni_sdk_file_open(&runtime_->sdk, &file->sdk, path.c_str(),
                                  flags, 0644);
-    sdk_time.Stop();
+    }
+    lock.lock();
+    --file->active;
+    runtime_->idle.notify_all();
     if (rc) {
-        files_.erase(it);
+        files_.erase(fd);
         return tl::make_unexpected(Translate(rc, ErrorCode::FILE_OPEN_FAIL));
     }
     ResultOwner metadata;
     cogni_sdk_status_v1 status{};
     cogni_sdk_inode_view_v1 view{};
     view.struct_size = sizeof(view);
-    rc = cogni_sdk_file_metadata_v1(&it->second.sdk, &metadata.value, &status);
+    rc = cogni_sdk_file_metadata_v1(&file->sdk, &metadata.value, &status);
     if (!rc) rc = cogni_sdk_result_inode_v1(&metadata.value, &view, &status);
     if (rc || (expected_size && view.inode.size != *expected_size)) {
         const auto error = rc ? Translate(rc, ErrorCode::FILE_OPEN_FAIL)
                               : ErrorCode::INVALID_PARAMS;
-        if (!cogni_sdk_file_close(&it->second.sdk)) files_.erase(it);
+        if (!cogni_sdk_file_close(&file->sdk)) files_.erase(fd);
         return tl::make_unexpected(error);
     }
     if ((flags & O_ACCMODE) != O_RDONLY) {
@@ -453,7 +466,7 @@ tl::expected<int, ErrorCode> CogniStoreFsAdapter::Open(
         const uint64_t bytes =
             uint64_t(layout.chunk_size) * layout.data_fragments;
         if (layout.parity_fragments && bytes && bytes <= kMaxStripeBytes)
-            it->second.stripe_bytes = size_t(bytes);
+            file->stripe_bytes = size_t(bytes);
     }
     return fd;
 }
@@ -687,10 +700,6 @@ CogniStoreFsAdapter::CoalescedTransfer(
     if (runtime_->poisoned) return fail(-EIO);
     file = files_.find(fd);
     if (file == files_.end() || file->second.closing) return fail(-EBADF);
-    ProfileScope setup_time(runtime_->profile, AdapterProfile::ReadSetup, read);
-    int rc = stripe->Start(runtime_->sdk, runtime_->numa);
-    setup_time.Stop();
-    if (rc) return fail(rc);
     // Map element addresses survive rehash. Close waits for this retained use.
     auto* retained = &file->second;
     ++retained->active;
@@ -712,6 +721,16 @@ CogniStoreFsAdapter::CoalescedTransfer(
     // Let metadata operations on other handles proceed during SDK waits and
     // scatter copies. The lease retains this File, IOR and registered buffer.
     lock.unlock();
+    int rc = 0;
+    if (!stripe->write.private_data) {
+        // Always release the state lock before acquiring the shared SDK lock.
+        // The lease pins this File and StripeIo throughout lazy registration.
+        std::lock_guard sdk_lock(runtime_->sdk_mutex);
+        ProfileScope setup_time(runtime_->profile, AdapterProfile::ReadSetup,
+                                read);
+        rc = stripe->Start(runtime_->sdk, runtime_->numa);
+    }
+    if (rc) return fail(rc);
     if (!read) {
         size_t copied = 0;
         for (const auto& r : requests) {
