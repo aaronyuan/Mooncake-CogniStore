@@ -539,14 +539,18 @@ void ReadAdmissionTest(const std::string& root) {
     Take(adapter.Init(root), "read admission init");
     const auto path = root + "/read-admission";
     const auto canonical = Take(adapter.CanonicalPath(root), "canonical root");
-    auto value = Pattern(stripe, 813);
-    Take(adapter.PreallocateFile(path, stripe), "read admission preallocate");
+    std::array<std::string, 2> values{Pattern(stripe, 813),
+                                      Pattern(stripe, 814)};
+    Take(adapter.PreallocateFile(path, 2 * stripe),
+         "read admission preallocate");
     int fd = Take(adapter.OpenExistingFile(path), "read admission writer");
-    iovec source{value.data(), value.size()};
-    FdIoRequest write{fd, &source, 1, 0};
-    Check(Take(adapter.BatchWriteAt({&write, 1}).front(), "seed read data") ==
-              stripe,
-          "short read fixture write");
+    for (size_t i = 0; i < values.size(); ++i) {
+        iovec source{values[i].data(), stripe};
+        FdIoRequest write{fd, &source, 1, int64_t(i * stripe)};
+        Check(Take(adapter.BatchWriteAt({&write, 1}).front(),
+                   "seed read data") == stripe,
+              "short read fixture write");
+    }
     Take(adapter.CloseFile(fd), "read fixture close");
     std::barrier start{int(lanes)};
     std::array<std::exception_ptr, lanes> errors{};
@@ -556,18 +560,20 @@ void ReadAdmissionTest(const std::string& root) {
             start.arrive_and_wait();
             try {
                 for (size_t round = 0; round < 4; ++round) {
-                    const int reader = Take(adapter.OpenValidatedFile(
-                                                path, stripe, canonical, false),
-                                            "concurrent open");
+                    const int reader =
+                        Take(adapter.OpenValidatedFile(path, 2 * stripe,
+                                                       canonical, false),
+                             "concurrent open");
                     // Mix the shared fallback buffer with coalesced reads.
                     const size_t bytes = lane % 2 ? stripe : 1024 * 1024;
                     std::string got(bytes, char(0xcd));
                     iovec dest{got.data(), bytes};
-                    FdIoRequest read{reader, &dest, 1, 0};
+                    const size_t index = (lane + round) % values.size();
+                    FdIoRequest read{reader, &dest, 1, int64_t(index * stripe)};
                     const auto result = adapter.BatchReadAt({&read, 1});
                     Take(adapter.CloseFile(reader), "concurrent read close");
                     Check(Take(result.front(), "concurrent read") == bytes &&
-                              got == value.substr(0, bytes),
+                              got == values[index].substr(0, bytes),
                           "concurrent read payload mismatch");
                 }
             } catch (...) {

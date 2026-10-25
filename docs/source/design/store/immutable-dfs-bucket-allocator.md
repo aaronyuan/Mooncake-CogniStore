@@ -124,10 +124,11 @@ parallel within the same process Runtime. Each admitted batch owns a registered
 buffer and a read/write IOR pair; these resources are allocated lazily, with at
 most 64 MiB of stripe buffers plus the existing 8 MiB fallback buffer per
 Runtime. Operations on the same File handle remain exclusive, and normal close
-waits for its retained transfer to finish. One coalesced reader is admitted at a
-time; it releases the Runtime mutex during SDK I/O and scatter copies, allowing
-metadata operations on other handles to proceed. Its File, buffer and IOR remain
-exclusive until completion. Partial-write and small-read fallback retain the
+waits for its retained transfer to finish. One coalesced SDK read is admitted at
+a time; it releases the Runtime mutex during SDK I/O and scatter copies, allowing
+metadata operations on other handles to proceed. Once its CQE is reaped, the next
+independent read may use another free buffer while the previous result is copied.
+Each File, buffer and IOR remain exclusive until that transfer finishes copying. Partial-write and small-read fallback retain the
 Runtime mutex and their shared buffer. Applications must stop submitting before
 shutdown.
 

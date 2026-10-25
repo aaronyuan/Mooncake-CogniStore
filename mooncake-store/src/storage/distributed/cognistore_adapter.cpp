@@ -670,6 +670,7 @@ CogniStoreFsAdapter::CoalescedTransfer(
     auto* retained = &file->second;
     ++retained->active;
     stripe->busy = true;
+    bool owns_read_admission = read;
     if (read) runtime_->coalesced_read_busy = true;
     auto release = [&](Runtime::StripeIo* used) {
         ProfileScope release_wait(runtime_->profile,
@@ -678,14 +679,13 @@ CogniStoreFsAdapter::CoalescedTransfer(
         release_wait.Stop();
         --retained->active;
         used->busy = false;
-        if (read) runtime_->coalesced_read_busy = false;
+        if (owns_read_admission) runtime_->coalesced_read_busy = false;
         runtime_->idle.notify_all();
     };
     std::unique_ptr<Runtime::StripeIo, decltype(release)> lease(stripe,
                                                                 release);
-    // Retain one coalesced reader and its buffer locality, but let metadata
-    // operations on other handles proceed during SDK waits and scatter copies.
-    // The lease keeps this File and IOR exclusive until completion.
+    // Let metadata operations on other handles proceed during SDK waits and
+    // scatter copies. The lease retains this File, IOR and registered buffer.
     lock.unlock();
     if (!read) {
         size_t copied = 0;
@@ -719,6 +719,20 @@ CogniStoreFsAdapter::CoalescedTransfer(
     }
     if (cqe.result < 0) return fail(cqe.result);
     if (read) {
+        // The CQE releases SDK ownership. Admit the next independent reader
+        // while this caller copies, retaining this File and buffer until done.
+        // The next reader must use another free StripeIo; never release its
+        // admission when this older transfer's lease later goes out of scope.
+        {
+            ProfileScope release_wait(runtime_->profile,
+                                      AdapterProfile::ReadReleaseLock);
+            lock.lock();
+            release_wait.Stop();
+            runtime_->coalesced_read_busy = false;
+            owns_read_admission = false;
+            runtime_->idle.notify_all();
+            lock.unlock();
+        }
         ProfileScope copy_time(runtime_->profile, AdapterProfile::ReadCopy);
         if (runtime_->profile.enabled)
             runtime_->profile.copied_bytes += cqe.result;
