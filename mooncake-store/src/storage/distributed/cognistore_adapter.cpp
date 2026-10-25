@@ -20,6 +20,8 @@ namespace {
 constexpr size_t kBufferSize = 1024 * 1024;
 constexpr size_t kBatchEntries = 8;
 constexpr size_t kMaxStripeBytes = 16 * 1024 * 1024;
+constexpr size_t kDefaultStripeContexts = 4;
+constexpr size_t kMaxWriteDepth = 16;
 ErrorCode Translate(int64_t rc, ErrorCode fallback) {
     if (rc == -ENOENT) return ErrorCode::FILE_NOT_FOUND;
     if (rc == -EINVAL) return ErrorCode::INVALID_PARAMS;
@@ -165,7 +167,8 @@ struct CogniStoreFsAdapter::Runtime {
         }
     };
     // Independent producers share the SDK, but never an active buffer or IOR.
-    std::array<StripeIo, 4> stripes;
+    std::array<StripeIo, kMaxWriteDepth> stripes;
+    size_t write_depth{kDefaultStripeContexts};
     std::condition_variable idle;
     bool coalesced_read_busy{false};
     int numa{-1};
@@ -173,6 +176,15 @@ struct CogniStoreFsAdapter::Runtime {
 
     int Start(const std::string& path) {
         config = path;
+        if (const char* setting =
+                std::getenv("MOONCAKE_COGNISTORE_WRITE_DEPTH")) {
+            char* end = nullptr;
+            long parsed = std::strtol(setting, &end, 10);
+            if (!*setting || *end || parsed < 1 ||
+                parsed > static_cast<long>(kMaxWriteDepth))
+                return -EINVAL;
+            write_depth = static_cast<size_t>(parsed);
+        }
         if (cogni_sdk_abi_version() != COGNI_SDK_ABI_VERSION) return -ENOTSUP;
         int rc = cogni_sdk_create(&sdk, path.c_str(), nullptr);
         if (rc) return rc;
@@ -651,7 +663,12 @@ CogniStoreFsAdapter::CoalescedTransfer(
         // The C ABI requires external synchronization for each File handle.
         if (current->second.active || (read && runtime_->coalesced_read_busy))
             return false;
-        for (auto& candidate : runtime_->stripes) {
+        // Write depth does not expand the read/copy buffer pool or admit
+        // additional SDK reads. Both directions retain exclusive leases.
+        const size_t contexts =
+            read ? kDefaultStripeContexts : runtime_->write_depth;
+        for (size_t i = 0; i < contexts; ++i) {
+            auto& candidate = runtime_->stripes[i];
             if (!candidate.busy) {
                 stripe = &candidate;
                 return true;

@@ -441,10 +441,25 @@ void FullStripeTest(const std::string& root) {
     std::cout << "COGNISTORE_FULL_STRIPE_PASS stripe_bytes=16777216 objects=16"
                  " full=2 partial=1 gapped=1 unaligned=1 tail=17" << std::endl;
 }
+void WriteDepthConfigTest(const std::string& root) {
+    for (const char* value :
+         {"", "0", "-1", "17", "8x", "999999999999999999999999999999"}) {
+        Check(setenv("MOONCAKE_COGNISTORE_WRITE_DEPTH", value, 1) == 0,
+              "set invalid write depth");
+        CogniStoreFsAdapter adapter;
+        const auto result = adapter.Init(root);
+        Check(!result && result.error() == ErrorCode::INVALID_PARAMS,
+              "invalid write depth accepted");
+    }
+    unsetenv("MOONCAKE_COGNISTORE_WRITE_DEPTH");
+    std::cout << "COGNISTORE_WRITE_DEPTH_CONFIG_PASS invalid_cases=6"
+              << std::endl;
+}
+
 // More callers than stripe contexts exercise admission, shared fd lifetime,
 // distinct payload ownership and mixed fallback I/O in one SDK Runtime.
 void ParallelStripeTest(const std::string& root) {
-    constexpr size_t lanes = 8, stripe = 16 * 1024 * 1024;
+    constexpr size_t lanes = 20, stripe = 16 * 1024 * 1024;
     CogniStoreFsAdapter adapter;
     Take(adapter.Init(root), "parallel init");
     const auto path = root + "/parallel";
@@ -526,9 +541,10 @@ void ParallelStripeTest(const std::string& root) {
     }
     Take(adapter.CloseFile(ro), "parallel final close");
     Take(adapter.DeleteFile(path), "parallel cleanup");
-    std::cout << "COGNISTORE_PARALLEL_STRIPE_PASS lanes=8 rounds=2 shared_fd=1 "
-                 "independent_fd=8 partial=8"
-              << std::endl;
+    std::cout
+        << "COGNISTORE_PARALLEL_STRIPE_PASS lanes=20 rounds=2 shared_fd=1 "
+           "independent_fd=20 partial=20"
+        << std::endl;
 }
 
 // Concurrent open/read/close must preserve File, IOR and destination ownership
@@ -921,6 +937,8 @@ int main(int argc, char** argv) {
             BatchIoTest(root);
         else if (mode == "full-stripe")
             FullStripeTest(root);
+        else if (mode == "write-depth-config")
+            WriteDepthConfigTest(root);
         else if (mode == "parallel-stripe")
             ParallelStripeTest(root);
         else if (mode == "read-admission")

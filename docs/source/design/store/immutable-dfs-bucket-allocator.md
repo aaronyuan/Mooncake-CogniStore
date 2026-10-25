@@ -119,11 +119,15 @@ copy; non-adjacent or overlapping destinations retain ordered scatter copies.
 Other requests fall back to batches of up to
 eight 1 MiB SDK operations. Successful writes retain their SDK `fsync` boundary.
 
-Up to four independent full-stripe write batches can wait for SDK I/O in
-parallel within the same process Runtime. Each admitted batch owns a registered
-buffer and a read/write IOR pair; these resources are allocated lazily, with at
-most 64 MiB of stripe buffers plus the existing 8 MiB fallback buffer per
-Runtime. Operations on the same File handle remain exclusive, and normal close
+By default, up to four independent full-stripe write batches can wait for SDK
+I/O in parallel within the same process Runtime. Set
+`MOONCAKE_COGNISTORE_WRITE_DEPTH` to an integer from 1 to 16 before Runtime
+initialization to change this write admission limit. Increasing benchmark
+`iodepth` alone does not change the adapter limit. Each admitted batch owns a
+registered buffer and a read/write IOR pair; resources are allocated lazily.
+The shared stripe pool uses at most `max(4, write_depth) * 16 MiB`, plus the
+existing 8 MiB fallback buffer per Runtime: write depths 4 / 8 / 16 permit
+64 / 128 / 256 MiB. Reads continue to use only the first four contexts. Operations on the same File handle remain exclusive, and normal close
 waits for its retained transfer to finish. One coalesced SDK read is admitted at
 a time; it releases the Runtime mutex during SDK I/O and scatter copies, allowing
 metadata operations on other handles to proceed. Once its CQE is reaped, the next
