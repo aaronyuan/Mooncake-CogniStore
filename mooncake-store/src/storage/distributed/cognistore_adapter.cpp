@@ -601,6 +601,9 @@ CogniStoreFsAdapter::CoalescedTransfer(
     std::vector<tl::expected<size_t, ErrorCode>> results;
     results.reserve(requests.size());
     size_t total = 0;
+    void* read_destination = nullptr;
+    uintptr_t next_destination = 0;
+    bool contiguous_destination = true;
     for (const auto& r : requests) {
         if (r.fd != requests.front().fd || r.offset < 0 ||
             uint64_t(r.offset) != uint64_t(offset) + total || r.iovcnt <= 0 ||
@@ -611,6 +614,15 @@ CogniStoreFsAdapter::CoalescedTransfer(
             if ((r.iov[i].iov_len && !r.iov[i].iov_base) ||
                 r.iov[i].iov_len > kMaxStripeBytes - total)
                 return std::nullopt;
+            if (read && r.iov[i].iov_len) {
+                const auto address =
+                    reinterpret_cast<uintptr_t>(r.iov[i].iov_base);
+                if (!read_destination)
+                    read_destination = r.iov[i].iov_base;
+                else if (address != next_destination)
+                    contiguous_destination = false;
+                next_destination = address + r.iov[i].iov_len;
+            }
             length += r.iov[i].iov_len;
             total += r.iov[i].iov_len;
         }
@@ -710,9 +722,19 @@ CogniStoreFsAdapter::CoalescedTransfer(
         ProfileScope copy_time(runtime_->profile, AdapterProfile::ReadCopy);
         if (runtime_->profile.enabled)
             runtime_->profile.copied_bytes += cqe.result;
+        // Adjacent caller ranges are one destination extent. A single copy
+        // lets libc choose its large-transfer path without changing EOF
+        // lengths.
+        if (contiguous_destination && cqe.result)
+            std::memcpy(read_destination, stripe->buffer, size_t(cqe.result));
         size_t copied = 0;
         for (size_t i = 0; i < requests.size(); ++i) {
             const auto bytes = std::min(*results[i], size_t(cqe.result) - copied);
+            if (contiguous_destination) {
+                results[i] = bytes;
+                copied += bytes;
+                continue;
+            }
             size_t remaining = bytes;
             for (int j = 0; j < requests[i].iovcnt && remaining; ++j) {
                 const auto& v = requests[i].iov[j];

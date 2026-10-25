@@ -114,7 +114,9 @@ Writes additionally require stripe-aligned offsets and an integral number of
 EC data stripes, using the file's actual layout. No padding or waiting for a
 future batch is introduced. Reads larger than 1 MiB can be coalesced without
 stripe alignment; the returned byte count is scattered to each request, and
-bytes past EOF remain untouched. Other requests fall back to batches of up to
+bytes past EOF remain untouched. Adjacent destination ranges use one buffer
+copy; non-adjacent or overlapping destinations retain ordered scatter copies.
+Other requests fall back to batches of up to
 eight 1 MiB SDK operations. Successful writes retain their SDK `fsync` boundary.
 
 Up to four independent full-stripe write batches can wait for SDK I/O in

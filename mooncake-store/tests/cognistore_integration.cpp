@@ -397,6 +397,38 @@ void FullStripeTest(const std::string& root) {
               eof_data[1].substr(0, 7) == expected.substr(capacity - 7) &&
               eof_data[1].substr(7) == std::string(size - 7, char(0xcd)),
           "coalesced EOF overwrote bytes or lost per-KV lengths");
+    // A contiguous destination follows the same partial-EOF and guard rules.
+    std::string contiguous(2 * size + 2, char(0xcd));
+    std::array<iovec, 2> contiguous_buffers{
+        {{contiguous.data() + 1, size}, {contiguous.data() + 1 + size, size}}};
+    auto contiguous_requests = eof_requests;
+    for (size_t i = 0; i < contiguous_requests.size(); ++i)
+        contiguous_requests[i].iov = &contiguous_buffers[i];
+    auto contiguous_result = adapter.BatchReadAt(contiguous_requests);
+    Check(Take(contiguous_result[0], "contiguous EOF first") == size &&
+              Take(contiguous_result[1], "contiguous EOF second") == 7 &&
+              contiguous.front() == char(0xcd) &&
+              contiguous.substr(1, size + 7) ==
+                  expected.substr(capacity - size - 7) &&
+              contiguous.substr(size + 8) == std::string(size - 6, char(0xcd)),
+          "contiguous EOF changed guards or bytes beyond EOF");
+    // Non-adjacent destinations retain ordered scatter semantics, including
+    // overlap: the second KV must replace the shared destination prefix.
+    std::string overlapping(size + 2, char(0xcd));
+    std::array<iovec, 2> overlap_buffers{
+        {{overlapping.data() + 1, size}, {overlapping.data() + 1, size}}};
+    auto overlap_requests = eof_requests;
+    for (size_t i = 0; i < overlap_requests.size(); ++i)
+        overlap_requests[i].iov = &overlap_buffers[i];
+    auto overlap_result = adapter.BatchReadAt(overlap_requests);
+    auto overlap_expected = expected.substr(capacity - size - 7, size);
+    overlap_expected.replace(0, 7, expected.substr(capacity - 7));
+    Check(Take(overlap_result[0], "overlap EOF first") == size &&
+              Take(overlap_result[1], "overlap EOF second") == 7 &&
+              overlapping.front() == char(0xcd) &&
+              overlapping.back() == char(0xcd) &&
+              overlapping.substr(1, size) == overlap_expected,
+          "coalesced overlap scatter changed bytes");
     eof_requests[0].offset = capacity;
     eof_requests[1].offset = capacity + size;
     const auto before = eof_data;
