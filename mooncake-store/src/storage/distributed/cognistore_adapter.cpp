@@ -494,9 +494,16 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::CloseFile(int fd) {
     ProfileScope idle_time(runtime_->profile, AdapterProfile::CloseIdle);
     runtime_->idle.wait(lock, [&] { return file->active == 0; });
     idle_time.Stop();
+    // Closing fences this File. Retain its map entry while the SDK drains it,
+    // so Shutdown waits, but unrelated handles can make progress meanwhile.
+    ++file->active;
+    lock.unlock();
     ProfileScope sdk_time(runtime_->profile, AdapterProfile::CloseSdk);
     int rc = cogni_sdk_file_close(&file->sdk);
     sdk_time.Stop();
+    lock.lock();
+    --file->active;
+    runtime_->idle.notify_all();
     if (rc) {
         file->closing = false;
         return tl::make_unexpected(

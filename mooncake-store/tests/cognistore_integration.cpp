@@ -466,13 +466,8 @@ void ParallelStripeTest(const std::string& root) {
     Take(adapter.PreallocateFile(path, lanes * stripe), "parallel preallocate");
     int fd = Take(adapter.OpenExistingFile(path), "parallel writer");
     int ro = Take(adapter.OpenExistingFileForRead(path), "parallel reader");
-    std::array<int, lanes> writers, readers;
-    for (size_t i = 0; i < lanes; ++i) {
-        writers[i] =
-            Take(adapter.OpenExistingFile(path), "parallel independent writer");
-        readers[i] = Take(adapter.OpenExistingFileForRead(path),
-                          "parallel independent reader");
-    }
+    const auto canonical_root =
+        Take(adapter.CanonicalPath(root), "parallel root");
     std::barrier start(int(lanes) + 1);
     std::array<std::exception_ptr, lanes> errors{};
     std::vector<std::thread> workers;
@@ -485,8 +480,20 @@ void ParallelStripeTest(const std::string& root) {
                     std::string got(stripe, char(0xcd));
                     iovec source{value.data(), stripe},
                         dest{got.data(), stripe};
-                    const int writer = round ? writers[lane] : fd;
-                    const int reader = round ? readers[lane] : ro;
+                    // Open/validate/close independent handles concurrently,
+                    // including while another caller still owns a stripe I/O.
+                    const int writer = round
+                                           ? Take(adapter.OpenValidatedFile(
+                                                      path, lanes * stripe,
+                                                      canonical_root, true),
+                                                  "parallel independent writer")
+                                           : fd;
+                    const int reader = round
+                                           ? Take(adapter.OpenValidatedFile(
+                                                      path, lanes * stripe,
+                                                      canonical_root, false),
+                                                  "parallel independent reader")
+                                           : ro;
                     FdIoRequest write{writer, &source, 1,
                                       int64_t(lane * stripe)};
                     FdIoRequest read{reader, &dest, 1, int64_t(lane * stripe)};
@@ -508,6 +515,13 @@ void ParallelStripeTest(const std::string& root) {
                                "parallel read") == stripe &&
                               got == value,
                           "parallel payload mismatch");
+                    if (round) {
+                        Take(adapter.CloseFile(writer),
+                             "parallel writer close");
+                        Take(adapter.CloseFile(reader),
+                             "parallel reader close");
+                        Check(!adapter.CloseFile(writer), "closed fd reused");
+                    }
                 }
             } catch (...) {
                 errors[lane] = std::current_exception();
@@ -518,12 +532,6 @@ void ParallelStripeTest(const std::string& root) {
     for (auto& worker : workers) worker.join();
     for (const auto& error : errors)
         if (error) std::rethrow_exception(error);
-    for (size_t i = 0; i < lanes; ++i) {
-        Take(adapter.CloseFile(writers[i]),
-             "parallel independent writer close");
-        Take(adapter.CloseFile(readers[i]),
-             "parallel independent reader close");
-    }
     Take(adapter.CloseFile(fd), "parallel close writer");
     Take(adapter.CloseFile(ro), "parallel close reader");
     ro = Take(adapter.OpenExistingFileForRead(path), "parallel reopen");
