@@ -559,7 +559,7 @@ void ReadAdmissionTest(const std::string& root) {
         workers.emplace_back([&, lane] {
             start.arrive_and_wait();
             try {
-                for (size_t round = 0; round < 4; ++round) {
+                for (size_t round = 0; round < 8; ++round) {
                     const int reader =
                         Take(adapter.OpenValidatedFile(path, 2 * stripe,
                                                        canonical, false),
@@ -569,11 +569,16 @@ void ReadAdmissionTest(const std::string& root) {
                     std::string got(bytes, char(0xcd));
                     iovec dest{got.data(), bytes};
                     const size_t index = (lane + round) % values.size();
-                    FdIoRequest read{reader, &dest, 1, int64_t(index * stripe)};
+                    const bool eof = round == 7;
+                    FdIoRequest read{
+                        reader, &dest, 1,
+                        int64_t(eof ? 2 * stripe : index * stripe)};
                     const auto result = adapter.BatchReadAt({&read, 1});
                     Take(adapter.CloseFile(reader), "concurrent read close");
-                    Check(Take(result.front(), "concurrent read") == bytes &&
-                              got == values[index].substr(0, bytes),
+                    Check(Take(result.front(), "concurrent read") ==
+                                  (eof ? 0 : bytes) &&
+                              got == (eof ? std::string(bytes, char(0xcd))
+                                          : values[index].substr(0, bytes)),
                           "concurrent read payload mismatch");
                 }
             } catch (...) {
@@ -586,8 +591,8 @@ void ReadAdmissionTest(const std::string& root) {
         if (error) std::rethrow_exception(error);
     Take(adapter.DeleteFile(path), "read admission cleanup");
     Take(adapter.Shutdown(), "read admission shutdown");
-    std::cout << "COGNISTORE_READ_ADMISSION_PASS lanes=8 rounds=4 "
-                 "coalesced=16 fallback=16"
+    std::cout << "COGNISTORE_READ_ADMISSION_PASS lanes=8 rounds=8 "
+                 "coalesced=32 fallback=32 eof=8"
               << std::endl;
 }
 
