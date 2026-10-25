@@ -4,6 +4,8 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
+#include <sstream>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
@@ -51,10 +53,84 @@ std::string String(cogni_sdk_bytes_v1 value) {
                                     value.size)
                       : std::string{};
 }
+// Opt-in aggregates: times are summed across callers, not phase wall time.
+// Emit once after draining the Runtime; never log in an I/O's hot loop.
+struct AdapterProfile {
+    enum Phase {
+        PathLock,
+        PathSdk,
+        OpenLock,
+        OpenSdk,
+        CloseLock,
+        CloseIdle,
+        CloseSdk,
+        ReadLock,
+        ReadIdle,
+        ReadSetup,
+        ReadWait,
+        ReadCopy,
+        ReadReleaseLock,
+        ReadTotal,
+        Count
+    };
+    static constexpr const char* names[Count] = {
+        "path_lock",         "path_sdk",   "open_lock", "open_sdk",
+        "close_lock",        "close_idle", "close_sdk", "read_lock",
+        "read_idle",         "read_setup", "read_wait", "read_copy",
+        "read_release_lock", "read_total"};
+    struct Counter {
+        std::atomic<uint64_t> calls{0}, ns{0};
+    };
+    const bool enabled = [] {
+        const auto* value = std::getenv("MOONCAKE_COGNISTORE_PROFILE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    std::array<Counter, Count> counters;
+    std::atomic<uint64_t> copied_bytes{0};
+    struct Scope {
+        using Clock = std::chrono::steady_clock;
+        Counter* counter;
+        Clock::time_point start;
+        Scope(AdapterProfile& profile, Phase phase, bool read = true)
+            : counter(profile.enabled && read ? &profile.counters[phase]
+                                              : nullptr),
+              start(counter ? Clock::now() : Clock::time_point{}) {}
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+        void Stop() {
+            if (!counter) return;
+            counter->ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+            counter->calls.fetch_add(1, std::memory_order_relaxed);
+            counter = nullptr;
+        }
+        ~Scope() { Stop(); }
+    };
+    void Report() const {
+        if (!enabled) return;
+        std::ostringstream output;
+        output << "COGNISTORE_ADAPTER_PROFILE {\"pid\":" << ::getpid()
+               << ",\"copied_bytes\":" << copied_bytes.load()
+               << ",\"stages\":{";
+        for (size_t i = 0; i < Count; ++i) {
+            if (i) output << ',';
+            output << '"' << names[i]
+                   << "\":{\"calls\":" << counters[i].calls.load()
+                   << ",\"ns\":" << counters[i].ns.load() << '}';
+        }
+        output << "}}";
+        LOG(INFO) << output.str();
+    }
+};
+using ProfileScope = AdapterProfile::Scope;
 }  // namespace
 
 struct CogniStoreFsAdapter::Runtime {
     std::mutex mutex;
+    AdapterProfile profile;
     std::string config;
     pid_t pid{::getpid()};
     cogni_sdk sdk{};
@@ -137,6 +213,7 @@ struct CogniStoreFsAdapter::Runtime {
         if (sdk.private_data) CHECK_EQ(cogni_sdk_shutdown(&sdk), 0);
         std::free(buffer);
         for (auto& stripe : stripes) std::free(stripe.buffer);
+        profile.Report();
     }
 };
 
@@ -257,14 +334,18 @@ tl::expected<bool, ErrorCode> CogniStoreFsAdapter::FileExists(
 tl::expected<std::string, ErrorCode> CogniStoreFsAdapter::CanonicalPath(
     const std::string& path) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
+    ProfileScope lock_wait(runtime_->profile, AdapterProfile::PathLock);
     std::lock_guard lock(runtime_->mutex);
+    lock_wait.Stop();
     auto request = Request<cogni_sdk_get_real_path_req_v1>();
     request.path = Path(path);
     request.absolute = 1;
     ResultOwner result;
     cogni_sdk_status_v1 status{};
+    ProfileScope sdk_time(runtime_->profile, AdapterProfile::PathSdk);
     int rc = cogni_sdk_get_real_path_v1(&runtime_->sdk, &request, &result.value,
                                         &status);
+    sdk_time.Stop();
     cogni_sdk_path_view_v1 view{};
     view.struct_size = sizeof(view);
     if (!rc) rc = cogni_sdk_result_path_v1(&result.value, &view, &status);
@@ -322,15 +403,19 @@ tl::expected<void, ErrorCode> CogniStoreFsAdapter::DeleteFile(
 tl::expected<int, ErrorCode> CogniStoreFsAdapter::Open(
     const std::string& path, int flags, std::optional<uint64_t> expected_size) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
+    ProfileScope lock_wait(runtime_->profile, AdapterProfile::OpenLock);
     std::lock_guard lock(runtime_->mutex);
+    lock_wait.Stop();
     if (next_fd_ == INT_MAX)
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     // Reserve the ID before open: a failed close after validation must retain
     // its SDK owner for Shutdown without colliding with a later open.
     const int fd = next_fd_++;
     auto [it, inserted] = files_.emplace(fd, File{});
+    ProfileScope sdk_time(runtime_->profile, AdapterProfile::OpenSdk);
     int rc = cogni_sdk_file_open(&runtime_->sdk, &it->second.sdk, path.c_str(),
                                  flags, 0644);
+    sdk_time.Stop();
     if (rc) {
         files_.erase(it);
         return tl::make_unexpected(Translate(rc, ErrorCode::FILE_OPEN_FAIL));
@@ -383,15 +468,21 @@ tl::expected<int, ErrorCode> CogniStoreFsAdapter::OpenExistingFileForRead(
 }
 tl::expected<void, ErrorCode> CogniStoreFsAdapter::CloseFile(int fd) {
     if (!runtime_) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
+    ProfileScope lock_wait(runtime_->profile, AdapterProfile::CloseLock);
     std::unique_lock lock(runtime_->mutex);
+    lock_wait.Stop();
     auto it = files_.find(fd);
     if (it == files_.end() || it->second.closing)
         return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     auto* file = &it->second;
     file->closing = true;
     runtime_->idle.notify_all();
+    ProfileScope idle_time(runtime_->profile, AdapterProfile::CloseIdle);
     runtime_->idle.wait(lock, [&] { return file->active == 0; });
+    idle_time.Stop();
+    ProfileScope sdk_time(runtime_->profile, AdapterProfile::CloseSdk);
     int rc = cogni_sdk_file_close(&file->sdk);
+    sdk_time.Stop();
     if (rc) {
         file->closing = false;
         return tl::make_unexpected(
@@ -413,12 +504,16 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::Transfer(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         total += vectors[i].iov_len;
     }
+    ProfileScope lock_wait(runtime_->profile, AdapterProfile::ReadLock, read);
     std::unique_lock lock(runtime_->mutex);
+    lock_wait.Stop();
+    ProfileScope idle_time(runtime_->profile, AdapterProfile::ReadIdle, read);
     runtime_->idle.wait(lock, [&] {
         auto current = files_.find(fd);
         return current == files_.end() || current->second.closing ||
                !current->second.active;
     });
+    idle_time.Stop();
     auto it = files_.find(fd);
     if (it == files_.end() || it->second.closing)
         return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
@@ -443,7 +538,10 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::Transfer(
                 return tl::make_unexpected(Translate(rc, failure));
             }
             cogni_sdk_cqe cqe{};
+            ProfileScope wait_time(runtime_->profile, AdapterProfile::ReadWait,
+                                   read);
             rc = cogni_sdk_wait_for_ios(ring, &cqe, 1, 1, nullptr);
+            wait_time.Stop();
             if (rc != 1 || cqe.index != index) {
                 runtime_->poisoned = true;
                 return tl::make_unexpected(failure);
@@ -454,9 +552,14 @@ tl::expected<size_t, ErrorCode> CogniStoreFsAdapter::Transfer(
                 runtime_->poisoned = true;
                 return tl::make_unexpected(failure);
             }
-            if (read)
+            if (read) {
+                ProfileScope copy_time(runtime_->profile,
+                                       AdapterProfile::ReadCopy);
                 std::memcpy(user, runtime_->buffer,
                             static_cast<size_t>(cqe.result));
+                if (runtime_->profile.enabled)
+                    runtime_->profile.copied_bytes += cqe.result;
+            }
             done += cqe.result;
             part += cqe.result;
             if (static_cast<size_t>(cqe.result) != n) {
@@ -485,7 +588,9 @@ std::optional<std::vector<tl::expected<size_t, ErrorCode>>>
 CogniStoreFsAdapter::CoalescedTransfer(
     std::span<const FdIoRequest> requests, bool read) {
     if (requests.empty() || !runtime_) return std::nullopt;
+    ProfileScope lock_wait(runtime_->profile, AdapterProfile::ReadLock, read);
     std::unique_lock lock(runtime_->mutex);
+    lock_wait.Stop();
     auto file = files_.find(requests.front().fd);
     if (file == files_.end() || (!read && !file->second.stripe_bytes))
         return std::nullopt;
@@ -523,6 +628,7 @@ CogniStoreFsAdapter::CoalescedTransfer(
     };
     Runtime::StripeIo* stripe = nullptr;
     const int fd = requests.front().fd;
+    ProfileScope idle_time(runtime_->profile, AdapterProfile::ReadIdle, read);
     runtime_->idle.wait(lock, [&] {
         auto current = files_.find(fd);
         if (runtime_->poisoned || current == files_.end() ||
@@ -538,17 +644,23 @@ CogniStoreFsAdapter::CoalescedTransfer(
         }
         return false;
     });
+    idle_time.Stop();
     if (runtime_->poisoned) return fail(-EIO);
     file = files_.find(fd);
     if (file == files_.end() || file->second.closing) return fail(-EBADF);
+    ProfileScope setup_time(runtime_->profile, AdapterProfile::ReadSetup, read);
     int rc = stripe->Start(runtime_->sdk, runtime_->numa);
+    setup_time.Stop();
     if (rc) return fail(rc);
     // Map element addresses survive rehash. Close waits for this retained use.
     auto* retained = &file->second;
     ++retained->active;
     stripe->busy = true;
     auto release = [&](Runtime::StripeIo* used) {
+        ProfileScope release_wait(runtime_->profile,
+                                  AdapterProfile::ReadReleaseLock, read);
         if (!lock.owns_lock()) lock.lock();
+        release_wait.Stop();
         --retained->active;
         used->busy = false;
         runtime_->idle.notify_all();
@@ -581,13 +693,18 @@ CogniStoreFsAdapter::CoalescedTransfer(
         return fail(rc);
     }
     cogni_sdk_cqe cqe{};
+    ProfileScope wait_time(runtime_->profile, AdapterProfile::ReadWait, read);
     rc = cogni_sdk_wait_for_ios(ring, &cqe, 1, 1, nullptr);
+    wait_time.Stop();
     if (rc != 1 || cqe.index != index || cqe.result > int64_t(total)) {
         runtime_->poisoned = true;
         return fail(-EIO);
     }
     if (cqe.result < 0) return fail(cqe.result);
     if (read) {
+        ProfileScope copy_time(runtime_->profile, AdapterProfile::ReadCopy);
+        if (runtime_->profile.enabled)
+            runtime_->profile.copied_bytes += cqe.result;
         size_t copied = 0;
         for (size_t i = 0; i < requests.size(); ++i) {
             const auto bytes = std::min(*results[i], size_t(cqe.result) - copied);
@@ -625,6 +742,8 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchWriteAt(
 }
 std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchReadAt(
     std::span<const FdIoRequest> requests) {
+    if (!runtime_) return BatchTransfer(requests, true);
+    ProfileScope total(runtime_->profile, AdapterProfile::ReadTotal);
     if (auto combined = CoalescedTransfer(requests, true))
         return std::move(*combined);
     return BatchTransfer(requests, true);
@@ -664,7 +783,12 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
             }
             continue;
         }
+        ProfileScope lock_wait(runtime_->profile, AdapterProfile::ReadLock,
+                               read);
         std::unique_lock lock(runtime_->mutex);
+        lock_wait.Stop();
+        ProfileScope idle_time(runtime_->profile, AdapterProfile::ReadIdle,
+                               read);
         runtime_->idle.wait(lock, [&] {
             return std::all_of(
                 wave.begin(), wave.end(), [&](const auto& request) {
@@ -673,6 +797,7 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
                            !file->second.active;
                 });
         });
+        idle_time.Stop();
         if (runtime_->poisoned) break;
         auto* ring = read ? &runtime_->batch_read : &runtime_->batch_write;
         std::array<int, kBatchEntries> indices;
@@ -708,7 +833,10 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
         if (pending && cogni_sdk_submit_ios(ring)) runtime_->poisoned = true;
         while (pending && !runtime_->poisoned) {
             std::array<cogni_sdk_cqe, kBatchEntries> cqes{};
+            ProfileScope wait_time(runtime_->profile, AdapterProfile::ReadWait,
+                                   read);
             int count = cogni_sdk_wait_for_ios(ring, cqes.data(), pending, 1, nullptr);
+            wait_time.Stop();
             if (count <= 0 || size_t(count) > pending) {
                 runtime_->poisoned = true;
                 break;
@@ -738,6 +866,10 @@ std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchTransfer(
             if (!results[start + i]) continue;
             const auto& r = wave[i];
             if (read) {
+                ProfileScope copy_time(runtime_->profile,
+                                       AdapterProfile::ReadCopy);
+                if (runtime_->profile.enabled)
+                    runtime_->profile.copied_bytes += *results[start + i];
                 size_t copied = 0;
                 auto* buffer = static_cast<char*>(runtime_->buffer) + i * kBufferSize;
                 for (int j = 0; j < r.iovcnt && copied < *results[start + i]; ++j) {

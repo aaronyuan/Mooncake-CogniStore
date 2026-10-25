@@ -125,6 +125,16 @@ Runtime. Operations on the same File handle remain exclusive, and normal close
 waits for its retained transfer to finish. Reads and partial-write fallback keep
 their serialization. Applications must stop submitting before shutdown.
 
+For diagnostic runs, set `MOONCAKE_COGNISTORE_PROFILE=1` before Runtime
+initialization. Shutdown emits one `COGNISTORE_ADAPTER_PROFILE` JSON record with
+call counts and cumulative nanoseconds for canonical/open/close mutex waits,
+SDK metadata calls, read admission, SDK completion waits, and buffer copies.
+`read_total` measures complete `BatchReadAt` calls, including fallback work;
+`copied_bytes` includes all adapter reads. `read_idle` includes condition-variable
+waiting and mutex reacquisition. These are caller-time aggregates, may overlap
+across threads, and must not be added to phase wall time. Profiling is disabled
+by default and does not log individual I/O operations.
+
 For `batch_get_into`, DFS can read directly into a host destination fully covered
 by a known writable registration or the client's local buffer region. This
 avoids one Mooncake staging allocation and copy. Device destinations, unknown
