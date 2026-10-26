@@ -170,6 +170,14 @@ waiting and mutex reacquisition. These are caller-time aggregates, may overlap
 across threads, and must not be added to phase wall time. Profiling is disabled
 by default and does not log individual I/O operations.
 
+For host-only `batch_put` with only DFS replicas, the client borrows the caller's
+source buffers until the synchronous DFS write and publication complete. This
+removes the transfer-engine staging allocation and copy before the adapter's
+SDK IOV copy. Callers must keep sources valid and unchanged until return;
+they can reuse or modify them afterwards. Device inputs and configurations
+containing MEMORY or NoF replicas retain the existing staging path. Checksum
+computation and per-object publication/error handling are unchanged.
+
 For `batch_get_into`, DFS can read directly into a host destination fully covered
 by a known writable registration or the client's local buffer region. This
 avoids one Mooncake staging allocation and copy. Device destinations, unknown

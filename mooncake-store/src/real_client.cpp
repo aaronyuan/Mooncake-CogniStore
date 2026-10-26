@@ -2572,7 +2572,14 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         LOG(ERROR) << "Key and value size mismatch";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!client_buffer_allocator) {
+    auto accelerators = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    const bool dfs_only =
+        config.replica_num == 0 && config.nof_replica_num == 0 &&
+        config.dfs_replica_num > 0 &&
+        std::all_of(values.begin(), values.end(), [&](const auto &value) {
+            return !accelerators.FindDeviceForPointer(value.data());
+        });
+    if (!client_buffer_allocator && !dfs_only) {
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -2583,6 +2590,16 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     for (size_t i = 0; i < keys.size(); ++i) {
         auto &key = keys[i];
         auto &value = values[i];
+        if (dfs_only) {
+            // DFS writes finish before BatchPut returns. Borrow the caller's
+            // source until then instead of copying it into the transfer-engine
+            // allocator first. Device inputs and MEMORY/NoF replicas retain
+            // the registered staging allocation below.
+            batched_slices.emplace(
+                key, split_into_slices(const_cast<char *>(value.data()),
+                                       value.size_bytes()));
+            continue;
+        }
         auto alloc_result =
             client_buffer_allocator->allocate(value.size_bytes());
         if (!alloc_result) {

@@ -258,6 +258,88 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     }
 }
 
+TEST_F(RealClientTest, BatchPutDfsUsesCallerBuffersWithoutStaging) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+    char path[] = "/tmp/mooncake_direct_dfs_put_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17835", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    const std::vector<std::string> keys{"borrowed_a", "borrowed_b",
+                                        "borrowed_c"};
+    const std::vector<std::string> expected{
+        std::string(4096, 'a'), std::string(8192, 'b'), std::string(4096, 'c')};
+    auto source = expected;
+    std::vector<std::span<const char>> values;
+    for (const auto& value : source) values.emplace_back(value);
+    ReplicateConfig config;
+    config.replica_num = 0;
+    config.dfs_replica_num = 1;
+
+    // No transfer-engine staging allocator is available. The unregistered
+    // caller buffers must be consumed synchronously by the DFS path.
+    auto allocator = std::move(py_client_->client_buffer_allocator_);
+    const int written = py_client_->put_batch(keys, values, config);
+    ReplicateConfig mixed = config;
+    mixed.replica_num = 1;
+    EXPECT_NE(py_client_->put_batch({"mixed"}, {values[0]}, mixed), 0);
+    ReplicateConfig nof = config;
+    nof.nof_replica_num = 1;
+    EXPECT_NE(py_client_->put_batch({"nof"}, {values[0]}, nof), 0);
+    py_client_->client_buffer_allocator_ = std::move(allocator);
+    ASSERT_EQ(written, 0);
+    for (auto& value : source) std::fill(value.begin(), value.end(), 'z');
+
+    std::vector<std::string> output = expected;
+    std::vector<void*> destinations;
+    std::vector<size_t> sizes;
+    for (auto& value : output) {
+        std::fill(value.begin(), value.end(), '?');
+        destinations.push_back(value.data());
+        sizes.push_back(value.size());
+    }
+    EXPECT_EQ(py_client_->batch_get_into(keys, destinations, sizes),
+              std::vector<int64_t>({4096, 8192, 4096}));
+    EXPECT_EQ(output, expected);
+    for (const auto& key : keys) {
+        auto query = py_client_->client_->Query(key);
+        ASSERT_TRUE(query);
+        ASSERT_EQ(query->replicas.size(), 1);
+        EXPECT_TRUE(query->replicas[0].is_dfs_replica());
+        if (const auto* enabled = getenv("MOONCAKE_STORE_CHECKSUM");
+            enabled && std::string(enabled) == "1")
+            EXPECT_TRUE(query->object_checksum.has_value());
+    }
+    // Mixed MEMORY+DFS writes retain their registered staging path.
+    ASSERT_EQ(py_client_->put_batch({"mixed"}, {values[0]}, mixed), 0);
+    const auto replicas = py_client_->get_replica_desc("mixed");
+    EXPECT_EQ(
+        std::count_if(replicas.begin(), replicas.end(),
+                      [](const auto& r) { return r.is_memory_replica(); }),
+        1);
+    EXPECT_EQ(std::count_if(replicas.begin(), replicas.end(),
+                            [](const auto& r) { return r.is_dfs_replica(); }),
+              1);
+}
+
 TEST_F(RealClientTest, BatchGetIntoDfsRegisteredHostSkipsStaging) {
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",

@@ -271,6 +271,13 @@ add_test(
 )
 set_tests_properties(pybind_dfs_direct_read_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
+add_test(
+  NAME pybind_dfs_direct_write_test
+  COMMAND pybind_client_test
+    "--gtest_filter=RealClientTest.BatchPutDfsUsesCallerBuffersWithoutStaging"
+)
+set_tests_properties(pybind_dfs_direct_write_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(standalone_client_test standalone_client_test.cpp)
 add_store_test(embedded_master_test embedded_master_test.cpp)
 if(USE_TENT)
