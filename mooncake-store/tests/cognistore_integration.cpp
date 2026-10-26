@@ -441,6 +441,91 @@ void FullStripeTest(const std::string& root) {
     std::cout << "COGNISTORE_FULL_STRIPE_PASS stripe_bytes=16777216 objects=16"
                  " full=2 partial=1 gapped=1 unaligned=1 tail=17" << std::endl;
 }
+// A large batch must retain full-stripe I/O even when a KV or iovec crosses
+// the 16 MiB registered-buffer boundary. Reopen and verify all bytes and EOF.
+void MultiStripeTest(const std::string& root) {
+    constexpr size_t mib = 1024 * 1024, stripe = 16 * mib, count = 128;
+    constexpr size_t capacity = count * mib + 17;
+    CogniStoreFsAdapter adapter;
+    Take(adapter.Init(root), "multi init");
+    const auto path = root + "/multi";
+    Take(adapter.PreallocateFile(path, capacity), "multi preallocate");
+    int fd = Take(adapter.OpenExistingFile(path), "multi writer");
+    auto expected = Pattern(count * mib, 31);
+    std::array<std::array<iovec, 3>, count> vectors;
+    std::array<FdIoRequest, count> requests;
+    for (size_t i = 0; i < count; ++i) {
+        vectors[i] = {{{expected.data() + i * mib, 113},
+                       {nullptr, 0},
+                       {expected.data() + i * mib + 113, mib - 113}}};
+        requests[i] = {fd, vectors[i].data(), 3, int64_t(i * mib)};
+    }
+    // Reuse and grow an already-drained 16 MiB context for the large batch.
+    auto warm =
+        adapter.BatchWriteAt(std::span<const FdIoRequest>(requests).first(16));
+    for (const auto& result : warm)
+        Check(Take(result, "multi initial stripe") == mib,
+              "multi warm short write");
+    auto written = adapter.BatchWriteAt(requests);
+    Check(written.size() == count, "multi result count");
+    for (const auto& result : written)
+        Check(Take(result, "multi write") == mib, "multi short write");
+    // The first KV's iovec crosses an extent boundary. Both KVs together
+    // cover two stripes and must retain exact ordering and scatter lengths.
+    auto replacement = Pattern(2 * stripe, 47);
+    std::array<iovec, 2> large_vectors{
+        {{replacement.data(), stripe + 113},
+         {replacement.data() + stripe + 113, stripe - 113}}};
+    std::array<FdIoRequest, 2> large{
+        {{fd, &large_vectors[0], 1, int64_t(stripe)},
+         {fd, &large_vectors[1], 1, int64_t(2 * stripe + 113)}}};
+    written = adapter.BatchWriteAt(large);
+    for (size_t i = 0; i < large.size(); ++i)
+        Check(
+            Take(written[i], "cross-extent write") == large_vectors[i].iov_len,
+            "cross-extent short write");
+    expected.replace(stripe, replacement.size(), replacement);
+    Take(adapter.CloseFile(fd), "multi close writer");
+    fd = Take(adapter.OpenExistingFileForRead(path), "multi reader");
+    std::vector<std::string> values(count, std::string(mib + 2, char(0xcd)));
+    for (size_t i = 0; i < count; ++i) {
+        vectors[i] = {{{values[i].data() + 1, 113},
+                       {nullptr, 0},
+                       {values[i].data() + 114, mib - 113}}};
+        requests[i] = {fd, vectors[i].data(), 3, int64_t(i * mib)};
+    }
+    auto read = adapter.BatchReadAt(requests);
+    for (size_t i = 0; i < count; ++i)
+        Check(Take(read[i], "multi scatter read") == mib &&
+                  values[i].front() == char(0xcd) &&
+                  values[i].back() == char(0xcd) &&
+                  values[i].compare(1, mib, expected, i * mib, mib) == 0,
+              "multi scatter payload/guard mismatch");
+    expected.append(17, '\0');
+    std::string tail(4 * stripe + 2, char(0xcd));
+    std::array<iovec, 2> tail_vectors{
+        {{tail.data() + 1, 2 * stripe},
+         {tail.data() + 1 + 2 * stripe, 2 * stripe}}};
+    std::array<FdIoRequest, 2> tail_requests{
+        {{fd, &tail_vectors[0], 1, int64_t(capacity - 2 * stripe - 7)},
+         {fd, &tail_vectors[1], 1, int64_t(capacity - 7)}}};
+    read = adapter.BatchReadAt(tail_requests);
+    Check(Take(read[0], "multi EOF first") == 2 * stripe &&
+              Take(read[1], "multi EOF second") == 7 &&
+              tail.front() == char(0xcd) &&
+              tail.substr(1, 2 * stripe + 7) ==
+                  expected.substr(capacity - 2 * stripe - 7) &&
+              tail.substr(2 * stripe + 8) ==
+                  std::string(2 * stripe - 6, char(0xcd)),
+          "multi EOF changed lengths, guards or untouched bytes");
+    Take(adapter.CloseFile(fd), "multi reader close");
+    Take(adapter.DeleteFile(path), "multi cleanup");
+    Take(adapter.Shutdown(), "multi shutdown");
+    std::cout << "COGNISTORE_MULTI_STRIPE_PASS bytes=134217728 objects=128"
+                 " cross_extent_kv=1 scatter=1 eof=1"
+              << std::endl;
+}
+
 void WriteDepthConfigTest(const std::string& root) {
     for (const char* value :
          {"", "0", "-1", "17", "8x", "999999999999999999999999999999"}) {
@@ -939,8 +1024,11 @@ int main(int argc, char** argv) {
     FLAGS_logtostderr = true;
     try {
         Check(argc >= 3,
-              "usage: cognistore_integration adapter/small-io/batch-io/full-stripe/sparse-bucket ROOT | put/read ROOT "
-              "MASTER | concurrent-writer/concurrent-reader ROOT CONTROL_DIR VALUE_SIZE");
+              "usage: cognistore_integration "
+              "adapter/small-io/batch-io/full-stripe/multi-stripe/"
+              "sparse-bucket ROOT | put/read ROOT "
+              "MASTER | concurrent-writer/concurrent-reader ROOT CONTROL_DIR "
+              "VALUE_SIZE");
         std::string mode = argv[1], root = argv[2];
         if (mode == "adapter")
             AdapterTest(root);
@@ -950,6 +1038,8 @@ int main(int argc, char** argv) {
             BatchIoTest(root);
         else if (mode == "full-stripe")
             FullStripeTest(root);
+        else if (mode == "multi-stripe")
+            MultiStripeTest(root);
         else if (mode == "write-depth-config")
             WriteDepthConfigTest(root);
         else if (mode == "parallel-stripe")

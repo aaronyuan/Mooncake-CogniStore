@@ -108,16 +108,28 @@ observed metadata; it is not a fresh stat of another writer's changes. Build and
 run this adapter with a CogniStore SDK exporting that function. The ABI remains
 version 1 with one additive symbol; an older SDK shared library is insufficient.
 
-The adapter can combine a batch into one native SDK range when requests name
-the same file and their offsets are consecutive, with at most 16 MiB in total.
-Writes additionally require stripe-aligned offsets and an integral number of
-EC data stripes, using the file's actual layout. No padding or waiting for a
-future batch is introduced. Reads larger than 1 MiB can be coalesced without
-stripe alignment; the returned byte count is scattered to each request, and
-bytes past EOF remain untouched. Adjacent destination ranges use one buffer
-copy; non-adjacent or overlapping destinations retain ordered scatter copies.
-Other requests fall back to batches of up to
-eight 1 MiB SDK operations. Successful writes retain their SDK `fsync` boundary.
+The adapter can coalesce consecutive requests to the same file, up to 128 MiB
+per batch. It processes the batch in bounded SDK extents of at most 16 MiB.
+Writes require a stripe-aligned start and an integral number of EC data stripes; every extent
+also contains whole stripes according to the file's actual layout. A batch
+larger than 16 MiB therefore retains full-stripe writes instead of falling back
+to partial I/O. If the stripe geometry divides 16 MiB, a large write submits
+up to eight extents to the same write IOR before waiting, with a separate
+registered block for each accepted extent. Its write IOR uses depth zero to
+group available entries into an SDK job, including a final short batch. Depth
+one would serialize these extents when `max_jobs_per_ioring=1`. Other
+geometries retain sequential extents, and reads reuse a 16 MiB buffer. The adapter drains all accepted I/O,
+including after partial preparation or a CQE failure, before releasing ownership.
+It fsyncs once after all extents complete, and the
+backend still closes the handle before publishing success. There is no padding
+or waiting for a future batch.
+
+Reads larger than 1 MiB can be coalesced without stripe alignment. Extents may
+cross KV or iovec boundaries; byte counts remain per request and bytes past EOF
+stay untouched. Adjacent source ranges use one copy for a pipelined write;
+adjacent destination ranges use one copy per read extent. Non-adjacent or
+overlapping vectors retain ordered copies. Other
+requests fall back to batches of up to eight 1 MiB SDK operations.
 
 By default, up to four independent full-stripe write batches can wait for SDK
 I/O in parallel within the same process Runtime. Set
@@ -125,22 +137,34 @@ I/O in parallel within the same process Runtime. Set
 initialization to change this write admission limit. Increasing benchmark
 `iodepth` alone does not change the adapter limit. Each admitted batch owns a
 registered buffer and a read/write IOR pair; resources are allocated lazily.
-The shared stripe pool uses at most `max(4, write_depth) * 16 MiB`, plus the
-existing 8 MiB fallback buffer per Runtime: write depths 4 / 8 / 16 permit
-64 / 128 / 256 MiB. Reads continue to use only the first four contexts. Operations on the same File handle remain exclusive, and normal close
+A context starts with 16 MiB for a small write or read, and grows lazily up to
+128 MiB for a large write after all earlier I/O has drained. Thus write depths
+4 / 8 / 16 use up to 512 MiB / 1 GiB / 2 GiB of adapter payload buffers when all
+contexts serve 128 MiB batches, plus the existing 8 MiB fallback buffer per
+Runtime. Small-batch runs retain the previous 64 / 128 / 256 MiB bounds. Reads
+continue to use only the first four contexts. Operations on the same File
+handle remain exclusive, and normal close
 waits for its retained transfer to finish. One coalesced SDK read is admitted at
 a time; it releases the Runtime mutex during SDK I/O and scatter copies, allowing
 metadata operations on other handles to proceed. Once its CQE is reaped, the next
 independent read may use another free buffer while the previous result is copied.
+A multi-extent read reacquires read admission before each subsequent SDK I/O.
 Each File, buffer and IOR remain exclusive until that transfer finishes copying. Partial-write and small-read fallback retain the
 Runtime mutex and their shared buffer. Applications must stop submitting before
 shutdown.
 
+Shared SDK-handle metadata calls use a separate mutex from File/IOR state.
+Canonical lookup and open remain serialized as required by the SDK contract,
+but their RPC waits no longer block I/O on already-open independent handles.
+Normal close pins and fences its own File while allowing other handles to
+progress; shutdown waits for retained operations.
+
 For diagnostic runs, set `MOONCAKE_COGNISTORE_PROFILE=1` before Runtime
 initialization. Shutdown emits one `COGNISTORE_ADAPTER_PROFILE` JSON record with
 call counts and cumulative nanoseconds for canonical/open/close mutex waits,
-SDK metadata calls, read admission, SDK completion waits, and buffer copies.
-`read_total` measures complete `BatchReadAt` calls, including fallback work;
+SDK metadata calls, read/write admission, SDK read completion waits, and buffer
+copies. `read_total` and `write_total` measure complete `BatchReadAt` and
+`BatchWriteAt` calls, including fallback work;
 `copied_bytes` includes all adapter reads. `read_idle` includes condition-variable
 waiting and mutex reacquisition. These are caller-time aggregates, may overlap
 across threads, and must not be added to phase wall time. Profiling is disabled

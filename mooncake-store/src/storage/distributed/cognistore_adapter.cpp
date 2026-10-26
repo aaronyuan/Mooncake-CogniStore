@@ -20,6 +20,7 @@ namespace {
 constexpr size_t kBufferSize = 1024 * 1024;
 constexpr size_t kBatchEntries = 8;
 constexpr size_t kMaxStripeBytes = 16 * 1024 * 1024;
+constexpr size_t kMaxCoalescedBytes = 8 * kMaxStripeBytes;
 constexpr size_t kDefaultStripeContexts = 4;
 constexpr size_t kMaxWriteDepth = 16;
 ErrorCode Translate(int64_t rc, ErrorCode fallback) {
@@ -74,13 +75,19 @@ struct AdapterProfile {
         ReadReleaseLock,
         ReadTotal,
         BucketCreate,
+        WriteLock,
+        WriteIdle,
+        WriteSetup,
+        WriteCopy,
+        WriteTotal,
         Count
     };
     static constexpr const char* names[Count] = {
-        "path_lock",         "path_sdk",   "open_lock",    "open_sdk",
-        "close_lock",        "close_idle", "close_sdk",    "read_lock",
-        "read_idle",         "read_setup", "read_wait",    "read_copy",
-        "read_release_lock", "read_total", "bucket_create"};
+        "path_lock",         "path_sdk",    "open_lock",     "open_sdk",
+        "close_lock",        "close_idle",  "close_sdk",     "read_lock",
+        "read_idle",         "read_setup",  "read_wait",     "read_copy",
+        "read_release_lock", "read_total",  "bucket_create", "write_lock",
+        "write_idle",        "write_setup", "write_copy",    "write_total"};
     struct Counter {
         std::atomic<uint64_t> calls{0}, ns{0};
     };
@@ -146,21 +153,33 @@ struct CogniStoreFsAdapter::Runtime {
         cogni_sdk_iov iov{};
         cogni_sdk_ior read{}, write{};
         void* buffer{nullptr};
+        size_t capacity{0};
         bool busy{false};
 
-        int Start(cogni_sdk& sdk, int numa) {
-            if (iov.private_data && read.private_data && write.private_data)
-                return 0;
+        int Start(cogni_sdk& sdk, int numa, size_t bytes) {
+            if (iov.private_data && read.private_data && write.private_data) {
+                if (capacity >= bytes) return 0;
+                // The caller owns an idle context. Grow only after every old
+                // completion has been reaped; never resize an unknown owner.
+                Drain();
+                std::free(buffer);
+                buffer = nullptr;
+            }
             // A failed registration can retain an unknown owner until shutdown.
             if (buffer) return -EIO;
-            if (posix_memalign(&buffer, 4096, kMaxStripeBytes)) return -ENOMEM;
-            std::memset(buffer, 0, kMaxStripeBytes);
-            int rc = cogni_sdk_iov_register(&sdk, &iov, buffer, kMaxStripeBytes,
+            if (posix_memalign(&buffer, 4096, bytes)) return -ENOMEM;
+            capacity = bytes;
+            std::memset(buffer, 0, bytes);
+            int rc = cogni_sdk_iov_register(&sdk, &iov, buffer, bytes,
                                             kMaxStripeBytes, numa);
             if (rc) return rc;
             rc = cogni_sdk_ior_create(&sdk, &read, 1, 1, 1, 1, 30000, 0);
             if (rc) return rc;
-            return cogni_sdk_ior_create(&sdk, &write, 1, 0, 1, 1, 30000, 0);
+            // Depth zero groups available entries into one SDK job. Depth one
+            // serializes multi-stripe writes when max_jobs_per_ioring is one.
+            // It also dispatches a final short batch without waiting for more.
+            return cogni_sdk_ior_create(&sdk, &write, bytes / kMaxStripeBytes,
+                                        0, 0, 1, 30000, 0);
         }
         void Drain() {
             if (read.private_data) CHECK_EQ(cogni_sdk_ior_destroy(&read), 0);
@@ -622,7 +641,8 @@ std::optional<std::vector<tl::expected<size_t, ErrorCode>>>
 CogniStoreFsAdapter::CoalescedTransfer(
     std::span<const FdIoRequest> requests, bool read) {
     if (requests.empty() || !runtime_) return std::nullopt;
-    ProfileScope lock_wait(runtime_->profile, AdapterProfile::ReadLock, read);
+    ProfileScope lock_wait(runtime_->profile, read ? AdapterProfile::ReadLock
+                                                   : AdapterProfile::WriteLock);
     std::unique_lock lock(runtime_->mutex);
     lock_wait.Stop();
     auto file = files_.find(requests.front().fd);
@@ -634,9 +654,9 @@ CogniStoreFsAdapter::CoalescedTransfer(
     std::vector<tl::expected<size_t, ErrorCode>> results;
     results.reserve(requests.size());
     size_t total = 0;
-    void* read_destination = nullptr;
-    uintptr_t next_destination = 0;
-    bool contiguous_destination = true;
+    void* contiguous_base = nullptr;
+    uintptr_t next_address = 0;
+    bool contiguous_vectors = true;
     for (const auto& r : requests) {
         if (r.fd != requests.front().fd || r.offset < 0 ||
             uint64_t(r.offset) != uint64_t(offset) + total || r.iovcnt <= 0 ||
@@ -645,16 +665,16 @@ CogniStoreFsAdapter::CoalescedTransfer(
         size_t length = 0;
         for (int i = 0; i < r.iovcnt; ++i) {
             if ((r.iov[i].iov_len && !r.iov[i].iov_base) ||
-                r.iov[i].iov_len > kMaxStripeBytes - total)
+                r.iov[i].iov_len > kMaxCoalescedBytes - total)
                 return std::nullopt;
-            if (read && r.iov[i].iov_len) {
+            if (r.iov[i].iov_len) {
                 const auto address =
                     reinterpret_cast<uintptr_t>(r.iov[i].iov_base);
-                if (!read_destination)
-                    read_destination = r.iov[i].iov_base;
-                else if (address != next_destination)
-                    contiguous_destination = false;
-                next_destination = address + r.iov[i].iov_len;
+                if (!contiguous_base)
+                    contiguous_base = r.iov[i].iov_base;
+                else if (address != next_address)
+                    contiguous_vectors = false;
+                next_address = address + r.iov[i].iov_len;
             }
             length += r.iov[i].iov_len;
             total += r.iov[i].iov_len;
@@ -674,7 +694,8 @@ CogniStoreFsAdapter::CoalescedTransfer(
     };
     Runtime::StripeIo* stripe = nullptr;
     const int fd = requests.front().fd;
-    ProfileScope idle_time(runtime_->profile, AdapterProfile::ReadIdle, read);
+    ProfileScope idle_time(runtime_->profile, read ? AdapterProfile::ReadIdle
+                                                   : AdapterProfile::WriteIdle);
     runtime_->idle.wait(lock, [&] {
         auto current = files_.find(fd);
         if (runtime_->poisoned || current == files_.end() ||
@@ -721,96 +742,181 @@ CogniStoreFsAdapter::CoalescedTransfer(
     // Let metadata operations on other handles proceed during SDK waits and
     // scatter copies. The lease retains this File, IOR and registered buffer.
     lock.unlock();
+    const bool pipeline = !read && total > kMaxStripeBytes &&
+                          kMaxStripeBytes % retained->stripe_bytes == 0;
+    const size_t buffer_bytes =
+        pipeline ? ((total - 1) / kMaxStripeBytes + 1) * kMaxStripeBytes
+                 : kMaxStripeBytes;
     int rc = 0;
-    if (!stripe->write.private_data) {
+    if (!stripe->write.private_data || stripe->capacity < buffer_bytes) {
         // Always release the state lock before acquiring the shared SDK lock.
         // The lease pins this File and StripeIo throughout lazy registration.
+        ProfileScope setup_time(
+            runtime_->profile,
+            read ? AdapterProfile::ReadSetup : AdapterProfile::WriteSetup);
         std::lock_guard sdk_lock(runtime_->sdk_mutex);
-        ProfileScope setup_time(runtime_->profile, AdapterProfile::ReadSetup,
-                                read);
-        rc = stripe->Start(runtime_->sdk, runtime_->numa);
+        rc = stripe->Start(runtime_->sdk, runtime_->numa, buffer_bytes);
     }
     if (rc) return fail(rc);
-    if (!read) {
-        size_t copied = 0;
+    // Larger batches retain one File lease and fsync once. Each SDK extent
+    // is at most 16 MiB and every write extent contains only full stripes.
+    const size_t extent = read ? kMaxStripeBytes
+                               : kMaxStripeBytes / retained->stripe_bytes *
+                                     retained->stripe_bytes;
+    auto copy = [&](size_t begin, size_t bytes) {
+        ProfileScope copying(runtime_->profile, AdapterProfile::WriteCopy,
+                             !read);
+        if (contiguous_vectors) {
+            auto* user = static_cast<char*>(contiguous_base) + begin;
+            if (bytes) {
+                if (read)
+                    std::memcpy(user, stripe->buffer, bytes);
+                else
+                    std::memcpy(stripe->buffer, user, bytes);
+            }
+            return;
+        }
+        size_t position = 0, copied = 0;
         for (const auto& r : requests) {
-            for (int i = 0; i < r.iovcnt; ++i) {
-                if (r.iov[i].iov_len)
-                    std::memcpy(static_cast<char*>(stripe->buffer) + copied,
-                                r.iov[i].iov_base, r.iov[i].iov_len);
-                copied += r.iov[i].iov_len;
+            for (int i = 0; i < r.iovcnt && copied < bytes; ++i) {
+                const auto& v = r.iov[i];
+                const auto start = position;
+                position += v.iov_len;
+                if (position <= begin) continue;
+                const auto skip = begin > start ? begin - start : 0;
+                const auto n = std::min(v.iov_len - skip, bytes - copied);
+                if (n) {
+                    auto* user = static_cast<char*>(v.iov_base) + skip;
+                    auto* buffer = static_cast<char*>(stripe->buffer) + copied;
+                    if (read)
+                        std::memcpy(user, buffer, n);
+                    else
+                        std::memcpy(buffer, user, n);
+                }
+                copied += n;
+            }
+            if (copied == bytes) return;
+        }
+    };
+    size_t completed = 0;
+    if (pipeline) {
+        // Copy before prep can dispatch. Distinct IOV blocks keep all accepted
+        // extents alive together, unlike reusing one buffer after every wait.
+        copy(0, total);
+        constexpr size_t entries = kMaxCoalescedBytes / kMaxStripeBytes;
+        std::array<int, entries> indices;
+        indices.fill(-1);
+        std::array<size_t, entries> lengths{};
+        size_t pending = 0;
+        int64_t error = 0;
+        for (size_t pos = 0, i = 0; pos < total; ++i) {
+            lengths[i] = std::min(kMaxStripeBytes, total - pos);
+            indices[i] =
+                cogni_sdk_prep_io(&stripe->write, &retained->sdk, &stripe->iov,
+                                  offset + pos, pos, lengths[i], nullptr);
+            if (indices[i] < 0) {
+                error = indices[i];
+                indices[i] = -1;
+                break;
+            }
+            ++pending;
+            pos += lengths[i];
+        }
+        if (pending && (rc = cogni_sdk_submit_ios(&stripe->write))) {
+            runtime_->poisoned = true;
+            return fail(rc);
+        }
+        // Even after partial preparation or an individual CQE error, drain
+        // every accepted extent before releasing this buffer or File lease.
+        while (pending) {
+            std::array<cogni_sdk_cqe, entries> cqes{};
+            rc = cogni_sdk_wait_for_ios(&stripe->write, cqes.data(), pending, 1,
+                                        nullptr);
+            if (rc <= 0 || size_t(rc) > pending) {
+                runtime_->poisoned = true;
+                return fail(-EIO);
+            }
+            for (int i = 0; i < rc; ++i) {
+                auto found =
+                    std::find(indices.begin(), indices.end(), cqes[i].index);
+                if (cqes[i].index < 0 || found == indices.end()) {
+                    runtime_->poisoned = true;
+                    return fail(-EIO);
+                }
+                const auto n = lengths[size_t(found - indices.begin())];
+                *found = -1;
+                --pending;
+                if (!error && cqes[i].result != int64_t(n))
+                    error = cqes[i].result < 0 ? cqes[i].result : -EIO;
             }
         }
+        if (error) return fail(error);
+        completed = total;
     }
-    // One range operation. Writes use only exact caller bytes, without padding.
-    // Contiguous reads use one SDK request even across adjacent KV boundaries.
-    auto* ring = read ? &stripe->read : &stripe->write;
-    int index = cogni_sdk_prep_io(ring, &retained->sdk, &stripe->iov, offset, 0,
-                                  total, nullptr);
-    if (index < 0) return fail(index);
-    rc = cogni_sdk_submit_ios(ring);
-    if (rc) {
-        runtime_->poisoned = true;
-        return fail(rc);
-    }
-    cogni_sdk_cqe cqe{};
-    ProfileScope wait_time(runtime_->profile, AdapterProfile::ReadWait, read);
-    rc = cogni_sdk_wait_for_ios(ring, &cqe, 1, 1, nullptr);
-    wait_time.Stop();
-    if (rc != 1 || cqe.index != index || cqe.result > int64_t(total)) {
-        runtime_->poisoned = true;
-        return fail(-EIO);
-    }
-    if (cqe.result < 0) return fail(cqe.result);
-    if (read) {
-        // The CQE releases SDK ownership. Admit the next independent reader
-        // while this caller copies, retaining this File and buffer until done.
-        // The next reader must use another free StripeIo; never release its
-        // admission when this older transfer's lease later goes out of scope.
-        {
-            ProfileScope release_wait(runtime_->profile,
-                                      AdapterProfile::ReadReleaseLock);
+    while (completed < total) {
+        if (read && !owns_read_admission) {
             lock.lock();
-            release_wait.Stop();
-            runtime_->coalesced_read_busy = false;
-            owns_read_admission = false;
-            runtime_->idle.notify_all();
+            ProfileScope admission(runtime_->profile, AdapterProfile::ReadIdle);
+            runtime_->idle.wait(lock, [&] {
+                return runtime_->poisoned || !runtime_->coalesced_read_busy;
+            });
+            if (runtime_->poisoned) return fail(-EIO);
+            runtime_->coalesced_read_busy = owns_read_admission = true;
             lock.unlock();
         }
-        ProfileScope copy_time(runtime_->profile, AdapterProfile::ReadCopy);
-        if (runtime_->profile.enabled)
-            runtime_->profile.copied_bytes += cqe.result;
-        // Adjacent caller ranges are one destination extent. A single copy
-        // lets libc choose its large-transfer path without changing EOF
-        // lengths.
-        if (contiguous_destination && cqe.result)
-            std::memcpy(read_destination, stripe->buffer, size_t(cqe.result));
-        size_t copied = 0;
-        for (size_t i = 0; i < requests.size(); ++i) {
-            const auto bytes = std::min(*results[i], size_t(cqe.result) - copied);
-            if (contiguous_destination) {
-                results[i] = bytes;
-                copied += bytes;
-                continue;
-            }
-            size_t remaining = bytes;
-            for (int j = 0; j < requests[i].iovcnt && remaining; ++j) {
-                const auto& v = requests[i].iov[j];
-                const auto n = std::min(v.iov_len, remaining);
-                if (n)
-                    std::memcpy(v.iov_base,
-                                static_cast<char*>(stripe->buffer) + copied, n);
-                copied += n;
-                remaining -= n;
-            }
-            // EOF affects each KV independently; leave bytes past EOF untouched.
-            results[i] = bytes;
+        const auto bytes = std::min(extent, total - completed);
+        if (!read) copy(completed, bytes);
+        auto* ring = read ? &stripe->read : &stripe->write;
+        int index = cogni_sdk_prep_io(ring, &retained->sdk, &stripe->iov,
+                                      offset + completed, 0, bytes, nullptr);
+        if (index < 0) return fail(index);
+        rc = cogni_sdk_submit_ios(ring);
+        if (rc) {
+            runtime_->poisoned = true;
+            return fail(rc);
         }
-        VLOG(1) << "CogniStore coalesced read bytes=" << cqe.result
+        cogni_sdk_cqe cqe{};
+        ProfileScope wait_time(runtime_->profile, AdapterProfile::ReadWait,
+                               read);
+        rc = cogni_sdk_wait_for_ios(ring, &cqe, 1, 1, nullptr);
+        wait_time.Stop();
+        if (rc != 1 || cqe.index != index || cqe.result > int64_t(bytes)) {
+            runtime_->poisoned = true;
+            return fail(-EIO);
+        }
+        if (cqe.result < 0) return fail(cqe.result);
+        if (!read && size_t(cqe.result) != bytes) return fail(-EIO);
+        if (read) {
+            // Another reader can issue I/O while this extent is copied. Retain
+            // this buffer/File, and reacquire admission before the next extent.
+            {
+                ProfileScope release_wait(runtime_->profile,
+                                          AdapterProfile::ReadReleaseLock);
+                lock.lock();
+                release_wait.Stop();
+                runtime_->coalesced_read_busy = owns_read_admission = false;
+                runtime_->idle.notify_all();
+                lock.unlock();
+            }
+            ProfileScope copy_time(runtime_->profile, AdapterProfile::ReadCopy);
+            if (runtime_->profile.enabled)
+                runtime_->profile.copied_bytes += cqe.result;
+            copy(completed, size_t(cqe.result));
+        }
+        completed += size_t(cqe.result);
+        if (size_t(cqe.result) != bytes) break;
+    }
+    if (read) {
+        // EOF affects each KV independently; leave bytes past EOF untouched.
+        size_t remaining = completed;
+        for (auto& result : results) {
+            result = std::min(*result, remaining);
+            remaining -= *result;
+        }
+        VLOG(1) << "CogniStore coalesced read bytes=" << completed
                 << " requests=" << requests.size() << " offset=" << offset;
         return results;
     }
-    if (size_t(cqe.result) != total) return fail(-EIO);
     // This File handle remains exclusive through the fsync acknowledgement.
     rc = cogni_sdk_file_fsync(&retained->sdk);
     if (rc) return fail(rc);
@@ -821,6 +927,8 @@ CogniStoreFsAdapter::CoalescedTransfer(
 
 std::vector<tl::expected<size_t, ErrorCode>> CogniStoreFsAdapter::BatchWriteAt(
     std::span<const FdIoRequest> requests) {
+    if (!runtime_) return BatchTransfer(requests, false);
+    ProfileScope total(runtime_->profile, AdapterProfile::WriteTotal);
     if (auto combined = CoalescedTransfer(requests, false))
         return std::move(*combined);
     return BatchTransfer(requests, false);

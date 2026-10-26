@@ -9,7 +9,8 @@
 namespace mooncake {
 // Initial synchronous, copy-based bridge to the process-local SDK C ABI.
 // Bucket batching reuses handles and submits bounded SDK I/O batches.
-// Contiguous aligned writes coalesce into full stripes (up to 16 MiB).
+// Contiguous batches up to 128 MiB use bounded 16 MiB I/O extents; writes
+// preserve full stripes, pipeline up to eight extents, then fsync once.
 // Up to four coalesced writes have independent buffers/IORs in one Runtime.
 // Reads and partial-write fallback retain their serialization.
 // Close drains retained transfers. Stale-fd retries remain disabled.
